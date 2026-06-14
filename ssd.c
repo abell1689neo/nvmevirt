@@ -359,6 +359,17 @@ uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64
 	return nsecs_latest;
 }
 
+uint64_t ssd_advance_internal_write_buffer(struct ssd *ssd, uint64_t request_time, uint64_t length)
+{
+	uint64_t nsecs_latest = request_time;
+	struct ssdparams *spp = &ssd->sp;
+
+	nsecs_latest += spp->fw_wbuf_lat0;
+	nsecs_latest += spp->fw_wbuf_lat1 * DIV_ROUND_UP(length, KB(4));
+
+	return nsecs_latest;
+}
+
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 {
 	int c = ncmd->cmd;

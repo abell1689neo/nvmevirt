@@ -6,6 +6,7 @@
 
 #include "nvmev.h"
 #include "conv_ftl.h"
+#include "copy.h"
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -861,7 +862,10 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n", __func__,
 			    start_lpn, spp->tt_pgs);
-		return false;
+		ret->status = NVME_SC_LBA_RANGE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
 	}
 
 	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {
@@ -955,12 +959,19 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n",
 				__func__, start_lpn, spp->tt_pgs);
-		return false;
+		ret->status = NVME_SC_LBA_RANGE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
 	}
 
 	allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
-	if (allocated_buf_size < LBA_TO_BYTE(nr_lba))
-		return false;
+	if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
+		ret->status = NVME_SC_INTERNAL;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
 
 	nsecs_latest =
 		ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
@@ -1024,6 +1035,209 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	return true;
 }
 
+static uint64_t conv_copy_source_reads(struct nvmev_ns *ns, struct nvmev_request *req,
+				       struct nvmev_copy_ctx *ctx,
+				       struct nvmev_copy_range *ranges,
+				       uint64_t *source_read_bytes)
+{
+	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_ftl *conv_ftl = &conv_ftls[0];
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t nr_parts = ns->nr_parts;
+	uint64_t nsecs_latest = req->nsecs_start;
+	u32 i;
+
+	*source_read_bytes = 0;
+	for (i = 0; i < ctx->nr_ranges; i++) {
+		uint64_t start_lpn = ranges[i].slba / spp->secs_per_pg;
+		uint64_t end_lpn =
+			(ranges[i].slba + ranges[i].nlb - 1) / spp->secs_per_pg;
+		uint64_t lpn;
+
+		for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+			uint64_t local_lpn = lpn / nr_parts;
+			struct ppa ppa;
+			struct nand_cmd srd = {
+				.type = USER_IO,
+				.cmd = NAND_READ,
+				.stime = req->nsecs_start,
+				.xfer_size = spp->pgsz,
+				.interleave_pci_dma = false,
+			};
+
+			conv_ftl = &conv_ftls[lpn % nr_parts];
+			ppa = get_maptbl_ent(conv_ftl, local_lpn);
+				if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
+					continue;
+
+				srd.ppa = &ppa;
+				*source_read_bytes += spp->pgsz;
+				nsecs_latest = max(nsecs_latest,
+						   ssd_advance_nand(conv_ftl->ssd, &srd));
+			}
+	}
+
+	return nsecs_latest;
+}
+
+static void conv_copy_schedule_program(struct nvmev_request *req, struct conv_ftl *conv_ftl,
+				       struct buffer *wbuf, struct ppa *ppa,
+				       uint64_t nsecs_buf_done, uint64_t bytes,
+				       uint64_t *nsecs_latest)
+{
+	struct nand_cmd swr = {
+		.type = USER_IO,
+		.cmd = NAND_WRITE,
+		.stime = nsecs_buf_done,
+		.interleave_pci_dma = false,
+		.xfer_size = bytes,
+		.ppa = ppa,
+	};
+	uint64_t nsecs_completed;
+
+	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
+	*nsecs_latest = max(*nsecs_latest, nsecs_completed);
+	schedule_internal_operation(req->sq_id, nsecs_completed, wbuf, bytes);
+}
+
+static bool conv_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+{
+	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_ftl *conv_ftl = &conv_ftls[0];
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct buffer *wbuf = conv_ftl->ssd->write_buffer;
+	struct nvmev_copy_ctx ctx;
+	struct nvmev_copy_range *ranges = NULL;
+	uint32_t nr_parts = ns->nr_parts;
+	uint64_t start_lpn;
+	uint64_t end_lpn;
+	uint64_t lpn;
+	uint64_t program_pages;
+	uint64_t program_bytes;
+	uint64_t source_read_bytes;
+	uint64_t nsecs_source_done;
+	uint64_t nsecs_buf_done;
+	uint64_t nsecs_latest;
+	uint64_t pending_prog_bytes[SSD_PARTITIONS] = { 0 };
+	struct ppa pending_prog_ppa[SSD_PARTITIONS];
+	bool pending_prog_valid[SSD_PARTITIONS] = { false };
+	bool fua = le32_to_cpu(req->cmd->copy.cdw12) & (1u << 30);
+	uint32_t allocated_buf_size;
+	uint32_t part;
+	int err;
+
+	err = nvmev_copy_load_ranges(ns, &req->cmd->copy, &ctx, &ranges);
+	if (err) {
+		ret->status = NVME_SC_INTERNAL;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
+
+	if (ctx.status != NVME_SC_SUCCESS) {
+		ret->status = ctx.status;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
+
+	start_lpn = ctx.sdlba / spp->secs_per_pg;
+	end_lpn = (ctx.sdlba + ctx.total_lbas - 1) / spp->secs_per_pg;
+	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+		ret->status = NVME_SC_LBA_RANGE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		nvmev_copy_free_ranges(ranges);
+		return true;
+	}
+
+	program_pages = end_lpn - start_lpn + 1;
+	program_bytes = program_pages * spp->pgsz;
+	if (program_bytes > wbuf->size) {
+		ret->status = NVME_SC_CMD_SIZE_LIM_EXCEEDED;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		nvmev_copy_free_ranges(ranges);
+		return true;
+	}
+
+	allocated_buf_size = buffer_allocate(wbuf, program_bytes);
+	if (allocated_buf_size < program_bytes) {
+		ret->status = NVME_SC_INTERNAL;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		nvmev_copy_free_ranges(ranges);
+		return true;
+	}
+
+	nsecs_source_done = conv_copy_source_reads(ns, req, &ctx, ranges,
+						   &source_read_bytes);
+	nsecs_buf_done = ssd_advance_internal_write_buffer(conv_ftl->ssd, nsecs_source_done,
+							   program_bytes);
+	nsecs_latest = nsecs_buf_done;
+
+	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+		uint64_t local_lpn;
+		struct ppa ppa;
+
+		part = lpn % nr_parts;
+		conv_ftl = &conv_ftls[part];
+		local_lpn = lpn / nr_parts;
+
+		ppa = get_maptbl_ent(conv_ftl, local_lpn);
+		if (mapped_ppa(&ppa)) {
+			mark_page_invalid(conv_ftl, &ppa);
+			set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
+		}
+
+		ppa = get_new_page(conv_ftl, USER_IO);
+		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+		set_rmap_ent(conv_ftl, local_lpn, &ppa);
+		mark_page_valid(conv_ftl, &ppa);
+		advance_write_pointer(conv_ftl, USER_IO);
+
+		pending_prog_ppa[part] = ppa;
+		pending_prog_bytes[part] += spp->pgsz;
+		pending_prog_valid[part] = true;
+
+		if (last_pg_in_wordline(conv_ftl, &ppa)) {
+			conv_copy_schedule_program(req, conv_ftl, wbuf, &pending_prog_ppa[part],
+						   nsecs_buf_done, pending_prog_bytes[part],
+						   &nsecs_latest);
+			pending_prog_bytes[part] = 0;
+			pending_prog_valid[part] = false;
+		}
+
+		consume_write_credit(conv_ftl);
+		check_and_refill_write_credit(conv_ftl);
+	}
+
+	for (part = 0; part < nr_parts; part++) {
+		if (!pending_prog_valid[part])
+			continue;
+
+		conv_copy_schedule_program(req, &conv_ftls[part], wbuf, &pending_prog_ppa[part],
+					   nsecs_buf_done, pending_prog_bytes[part],
+					   &nsecs_latest);
+	}
+
+	if (fua || (spp->write_early_completion == 0))
+		ret->nsecs_target = nsecs_latest;
+	else
+		ret->nsecs_target = nsecs_buf_done;
+
+	ret->status = NVME_SC_SUCCESS;
+	ret->bytes = LBA_TO_BYTE(ctx.total_lbas);
+	ret->copy_sdlba = ctx.sdlba;
+	ret->copy_nr_ranges = ctx.nr_ranges;
+	ret->copy_desc_bytes = ctx.desc_bytes;
+	ret->copy_source_read_bytes = source_read_bytes;
+	ret->copy_destination_write_bytes = program_bytes;
+	ret->copy_host_payload_avoided_bytes = ret->bytes * 2;
+	ret->copy_ranges = ranges;
+	return true;
+}
+
 static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	uint64_t start, latest;
@@ -1058,12 +1272,19 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		if (!conv_read(ns, req, ret))
 			return false;
 		break;
+	case nvme_cmd_copy:
+		if (!conv_copy(ns, req, ret))
+			return false;
+		break;
 	case nvme_cmd_flush:
 		conv_flush(ns, req, ret);
 		break;
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
 				nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+		ret->status = NVME_SC_INVALID_OPCODE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
 		break;
 	}
 

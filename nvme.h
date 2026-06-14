@@ -7,6 +7,7 @@
 #ifndef _LINUX_NVME_H
 #define _LINUX_NVME_H
 
+#include <linux/kernel.h>
 #include <linux/types.h>
 
 struct nvme_bar {
@@ -132,7 +133,8 @@ struct nvme_id_ctrl {
 	__u8 nvscc;
 	__u8 rsvd531;
 	__le16 acwu;
-	__u8 rsvd534[2];
+	__u8 ocfs;
+	__u8 rsvd535;
 	__le32 sgls;
 	__u8 rsvd540[1508];
 	struct nvme_id_power_state psd[32];
@@ -143,6 +145,7 @@ enum {
 	NVME_CTRL_ONCS_COMPARE = 1 << 0,
 	NVME_CTRL_ONCS_WRITE_UNCORRECTABLE = 1 << 1,
 	NVME_CTRL_ONCS_DSM = 1 << 2,
+	NVME_CTRL_ONCS_COPY = 1 << 8,
 	NVME_CTRL_VWC_PRESENT = 1 << 0,
 };
 
@@ -174,13 +177,22 @@ struct nvme_id_ns {
 	__le16 nabspf;
 	__u16 rsvd46;
 	__le64 nvmcap[2];
-	__u8 rsvd64[40];
+	__u8 rsvd64[10];
+	__le16 mssrl;
+	__le32 mcl;
+	__u8 msrc;
+	__u8 rsvd81[23];
 	__u8 nguid[16];
 	__u8 eui64[8];
 	struct nvme_lbaf lbaf[16];
 	__u8 rsvd192[192];
 	__u8 vs[3712];
 };
+
+static_assert(offsetof(struct nvme_id_ctrl, ocfs) == 534);
+static_assert(offsetof(struct nvme_id_ns, mssrl) == 74);
+static_assert(offsetof(struct nvme_id_ns, mcl) == 76);
+static_assert(offsetof(struct nvme_id_ns, msrc) == 80);
 
 struct nvme_id_ns_desc {
 	__u8 nidt; //namespace id type
@@ -313,6 +325,7 @@ struct nvme_reservation_status {
 	op(nvme_cmd_write_zeroes, 0x08)		\
 	op(nvme_cmd_dsm, 0x09)			\
 	op(nvme_cmd_verify, 0x0c)		\
+	op(nvme_cmd_copy, 0x19)			\
 	op(nvme_cmd_resv_register, 0x0d)	\
 	op(nvme_cmd_resv_report, 0x0e)		\
 	op(nvme_cmd_resv_acquire, 0x11)		\
@@ -341,7 +354,8 @@ static const char *const __nvme_opcode_strings[] = {
 };
 
 #define nvme_opcode_string(opcode) \
-	(__nvme_opcode_strings[opcode] ? __nvme_opcode_strings[opcode] : "unknown")
+	((opcode) < ARRAY_SIZE(__nvme_opcode_strings) && __nvme_opcode_strings[opcode] ? \
+		 __nvme_opcode_strings[opcode] : "unknown")
 
 struct nvme_common_command {
 	__u8 opcode;
@@ -446,6 +460,36 @@ struct nvme_dsm_range {
 	__le32 nlb;
 	__le64 slba;
 };
+
+struct nvme_copy_command {
+	__u8 opcode;
+	__u8 flags;
+	__u16 command_id;
+	__le32 nsid;
+	__le32 cdw2[2];
+	__le64 metadata;
+	__le64 prp1;
+	__le64 prp2;
+	__le64 sdlba;
+	__le32 cdw12;
+	__le16 dspec;
+	__le16 rsvd13;
+	__le32 reftag;
+	__le16 apptag;
+	__le16 appmask;
+};
+
+struct nvme_copy_range {
+	__u8 rsvd0[8];
+	__le64 slba;
+	__le16 nlb;
+	__u8 rsvd18[6];
+	__le32 eilbrt;
+	__le16 elbat;
+	__le16 elbatm;
+};
+
+static_assert(sizeof(struct nvme_copy_range) == 32);
 
 /* Admin commands */
 
@@ -629,6 +673,7 @@ struct nvme_command {
 		struct nvme_format_cmd format;
 		struct nvme_dsm_cmd dsm;
 		struct nvme_abort_cmd abort;
+		struct nvme_copy_command copy;
 	};
 };
 
@@ -679,9 +724,11 @@ enum {
 	NVME_SC_FEATURE_NOT_CHANGEABLE = 0x10e,
 	NVME_SC_FEATURE_NOT_PER_NS = 0x10f,
 	NVME_SC_FW_NEEDS_RESET_SUBSYS = 0x110,
+	NVME_SC_OVERLAPPING_RANGE = 0x114,
 	NVME_SC_BAD_ATTRIBUTES = 0x180,
 	NVME_SC_INVALID_PI = 0x181,
 	NVME_SC_READ_ONLY = 0x182,
+	NVME_SC_CMD_SIZE_LIM_EXCEEDED = 0x183,
 	NVME_SC_WRITE_FAULT = 0x280,
 	NVME_SC_READ_ERROR = 0x281,
 	NVME_SC_GUARD_CHECK = 0x282,

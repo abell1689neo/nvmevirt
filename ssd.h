@@ -260,6 +260,8 @@ void ssd_remove(struct ssd *ssd);
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd);
 uint64_t ssd_advance_pcie(struct ssd *ssd, uint64_t request_time, uint64_t length);
 uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64_t length);
+uint64_t ssd_advance_internal_write_buffer(struct ssd *ssd, uint64_t request_time,
+					   uint64_t length);
 uint64_t ssd_next_idle_time(struct ssd *ssd);
 
 void buffer_init(struct buffer *buf, size_t size);

@@ -215,6 +215,9 @@ bool zns_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct
 	default:
 		NVMEV_ERROR("%s: unimplemented command: %s(%d)\n", __func__,
 			    nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+		ret->status = NVME_SC_INVALID_OPCODE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
 		break;
 	}
 

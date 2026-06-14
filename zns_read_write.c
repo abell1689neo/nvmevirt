@@ -9,6 +9,21 @@ static inline uint32_t __nr_lbas_from_rw_cmd(struct nvme_rw_command *cmd)
 	return cmd->length + 1;
 }
 
+static bool __zns_lba_range_valid(struct nvmev_ns *ns, uint64_t slba, uint64_t nr_lba)
+{
+	uint64_t max_lbas = ns->size >> LBA_BITS;
+
+	return nr_lba && slba < max_lbas && nr_lba <= max_lbas - slba;
+}
+
+static void __zns_complete_status(struct nvmev_request *req, struct nvmev_result *ret,
+				  uint32_t status)
+{
+	ret->status = status;
+	ret->bytes = 0;
+	ret->nsecs_target = req->nsecs_start;
+}
+
 static bool __check_boundary_error(struct zns_ftl *zns_ftl, uint64_t slba, uint32_t nr_lba)
 {
 	return lba_to_zone(zns_ftl, slba) == lba_to_zone(zns_ftl, slba + nr_lba - 1);
@@ -81,6 +96,7 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	uint32_t status = NVME_SC_SUCCESS;
 
 	uint64_t pgs = 0;
+	uint64_t allocated_bytes = 0;
 
 	struct buffer *write_buffer;
 
@@ -102,8 +118,11 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	else
 		write_buffer = zns_ftl->ssd->write_buffer;
 
-	if (buffer_allocate(write_buffer, LBA_TO_BYTE(nr_lba)) < LBA_TO_BYTE(nr_lba))
-		return false;
+	if (buffer_allocate(write_buffer, LBA_TO_BYTE(nr_lba)) < LBA_TO_BYTE(nr_lba)) {
+		__zns_complete_status(req, ret, NVME_SC_INTERNAL);
+		return true;
+	}
+	allocated_bytes = LBA_TO_BYTE(nr_lba);
 
 	if ((LBA_TO_BYTE(nr_lba) % spp->write_unit_size) != 0) {
 		status = NVME_SC_ZNS_INVALID_WRITE;
@@ -213,6 +232,9 @@ static bool __zns_write(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	}
 
 out:
+	if (status != NVME_SC_SUCCESS && allocated_bytes)
+		buffer_release(write_buffer, allocated_bytes);
+
 	ret->status = status;
 	if ((cmd->control & NVME_RW_FUA) ||
 	    (spp->write_early_completion == 0)) /*Wait all flash operations*/
@@ -282,16 +304,20 @@ static bool __zns_write_zrwa(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	switch (state) {
 	case ZONE_STATE_CLOSED:
 	case ZONE_STATE_EMPTY: {
-		if (acquire_zone_resource(zns_ftl, OPEN_ZONE) == false) {
-			status = NVME_SC_ZNS_NO_OPEN_ZONE;
-			goto out;
-		}
+			if (acquire_zone_resource(zns_ftl, OPEN_ZONE) == false) {
+				status = NVME_SC_ZNS_NO_OPEN_ZONE;
+				goto out;
+			}
 
-		if (!buffer_allocate(&zns_ftl->zrwa_buffer[zid], zpp->zrwa_size))
-			NVMEV_ASSERT(0);
+			if (buffer_allocate(&zns_ftl->zrwa_buffer[zid], zpp->zrwa_size) <
+			    zpp->zrwa_size) {
+				status = NVME_SC_INTERNAL;
+				release_zone_resource(zns_ftl, OPEN_ZONE);
+				goto out;
+			}
 
-		// change to ZSIO
-		change_zone_state(zns_ftl, zid, ZONE_STATE_OPENED_IMPL);
+			// change to ZSIO
+			change_zone_state(zns_ftl, zid, ZONE_STATE_OPENED_IMPL);
 		break;
 	}
 	case ZONE_STATE_OPENED_IMPL:
@@ -330,8 +356,11 @@ static bool __zns_write_zrwa(struct zns_ftl *zns_ftl, struct nvmev_request *req,
 	}
 
 	if (nr_lbas_flush > 0) {
-		if (!buffer_allocate(&zns_ftl->zrwa_buffer[zid], LBA_TO_BYTE(nr_lbas_flush)))
-			return false;
+		if (buffer_allocate(&zns_ftl->zrwa_buffer[zid], LBA_TO_BYTE(nr_lbas_flush)) <
+		    LBA_TO_BYTE(nr_lbas_flush)) {
+			status = NVME_SC_INTERNAL;
+			goto out;
+		}
 
 		__increase_write_ptr(zns_ftl, zid, nr_lbas_flush);
 	}
@@ -385,10 +414,17 @@ bool zns_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_resu
 	struct zns_ftl *zns_ftl = (struct zns_ftl *)ns->ftls;
 	struct zone_descriptor *zone_descs = zns_ftl->zone_descs;
 	struct nvme_rw_command *cmd = &(req->cmd->rw);
-	uint64_t slpn = lba_to_lpn(zns_ftl, cmd->slba);
+	uint64_t slpn;
+	uint32_t zid;
 
+	if (!__zns_lba_range_valid(ns, cmd->slba, __nr_lbas_from_rw_cmd(cmd))) {
+		__zns_complete_status(req, ret, NVME_SC_LBA_RANGE);
+		return true;
+	}
+
+	slpn = lba_to_lpn(zns_ftl, cmd->slba);
 	// get zone from start_lba
-	uint32_t zid = lpn_to_zone(zns_ftl, slpn);
+	zid = lpn_to_zone(zns_ftl, slpn);
 
 	NVMEV_DEBUG("%s slba 0x%llx zone_id %d \n", __func__, cmd->slba, zid);
 
@@ -408,18 +444,27 @@ bool zns_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_resul
 	uint64_t slba = cmd->slba;
 	uint64_t nr_lba = __nr_lbas_from_rw_cmd(cmd);
 
-	uint64_t slpn = lba_to_lpn(zns_ftl, slba);
-	uint64_t elpn = lba_to_lpn(zns_ftl, slba + nr_lba - 1);
+	uint64_t slpn;
+	uint64_t elpn;
 	uint64_t lpn;
 
 	// get zone from start_lba
-	uint32_t zid = lpn_to_zone(zns_ftl, slpn);
+	uint32_t zid;
 	uint32_t status = NVME_SC_SUCCESS;
 	uint64_t nsecs_start = req->nsecs_start;
 	uint64_t nsecs_completed = nsecs_start, nsecs_latest = 0;
 	uint64_t pgs = 0, pg_off;
 	struct ppa ppa;
 	struct nand_cmd swr;
+
+	if (!__zns_lba_range_valid(ns, slba, nr_lba)) {
+		__zns_complete_status(req, ret, NVME_SC_LBA_RANGE);
+		return true;
+	}
+
+	slpn = lba_to_lpn(zns_ftl, slba);
+	elpn = lba_to_lpn(zns_ftl, slba + nr_lba - 1);
+	zid = lpn_to_zone(zns_ftl, slpn);
 
 	NVMEV_ZNS_DEBUG(
 		"%s slba 0x%llx nr_lba 0x%llx zone_id %d state %d wp 0x%llx last lba 0x%llx\n",

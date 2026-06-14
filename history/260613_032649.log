@@ -1,0 +1,731 @@
+NVMeVirt Simple Copy handoff log
+================================
+
+Timestamp: 2026-06-13 03:26:49 UTC
+Host: GCP Debian VM
+Kernel observed: 6.1.0-49-cloud-amd64
+Main repo under test: /home/USER/ostudy/nvmevirt-sc
+Original upstream copy preserved at: /home/USER/ostudy/nvmevirt
+Context repository preserved at: /home/USER/ostudy/context-md
+Primary plan document: /home/USER/ostudy/_temp/simple_copy_repo_and_experiment_plan.md
+
+Purpose of this file:
+  Handoff record for another agent/session. It records the implementation,
+  adversarial review results, build/test/runtime smoke results, known
+  problems, and exact current state after adding NVMe Simple Copy support to
+  NVMeVirt.
+
+
+1. User intent and working constraints
+--------------------------------------
+
+The user first asked to copy ostudy/nvmevirt to ostudy/nvmevirt-sc, then
+clarified that "do not work on nvmevirt-sc" was a warning rather than a ban:
+the desired work was to adversarially audit the implementation and experiment
+plan first, including all layers of consistency and safety, then implement.
+
+The user explicitly wanted:
+  1. A plan and implementation strong enough for a FAST-style research defense.
+  2. Safety/consistency review across all layers, not only kernel memory safety.
+  3. Implementation after adversarial review.
+  4. Code review plus tests.
+  5. Runtime smoke testing.
+  6. A handoff log for another agent.
+
+The environment has unrestricted filesystem permissions and no approval
+prompts. Network access is enabled. The user asked not to block on permission
+prompts because they intended to leave the agent running.
+
+
+2. High-level implementation claim
+----------------------------------
+
+The current prototype should be described as:
+
+  A scoped NVMe Simple Copy emulator and evaluation framework for NVMeVirt,
+  not a complete NVMe 2.x implementation and not a production SSD firmware
+  model.
+
+Defensible research claim:
+
+  Simple Copy is not just opcode plumbing. A faithful evaluation needs
+  host-visible capability advertisement, command validation, host traffic
+  avoidance, target-side media/FTL cost, benchmark byte accounting, and
+  negative controls separating useful offload from merely moving work into the
+  device.
+
+Supported target classes:
+  - CONFIG_NVMEVIRT_NVM:
+      latency-only NVM target with host-visible backing-memory copy.
+  - CONFIG_NVMEVIRT_SSD:
+      conventional page-mapped SSD target with source-read timing, internal
+      write-buffer timing without PCIe DMA, destination remap/program timing,
+      and exact host-visible backing-memory copy.
+
+Intentionally unsupported:
+  - multi-namespace copy,
+  - source namespace identifiers (snsids),
+  - metadata/protection information,
+  - nonzero directive fields,
+  - Copy Descriptor Format other than 0h,
+  - power-fail atomicity,
+  - filesystem integration, including native F2FS/copy_file_range semantics,
+  - production/commercial SSD firmware behavior.
+
+
+3. External facts checked for research context
+----------------------------------------------
+
+These are in the plan document and should be preserved for citations:
+
+  - NVM Express says the NVMe specification set defines host communication
+    with non-volatile memory over PCIe, RDMA, TCP, and other transports.
+    Its site listed the latest set as NVMe 2.3 released 2025-08-05.
+    URL: https://nvmexpress.org/specifications/
+
+  - NVM Express archives list public spec families including Base 2.2
+    ratified 2025-03-11 and NVM Command Set Specification 1.1.
+    URL: https://nvmexpress.org/nvm-express-specification-archives/
+
+  - Debian nvme-cli testing man page describes nvme-copy as sending an
+    NVMe Simple Copy command and says the command copies one or more source
+    logical block ranges to one consecutive destination logical block range.
+    URL: https://manpages.debian.org/testing/nvme-cli/nvme-copy.1.en.html
+
+  - libnvme exposes nvme_copy(struct nvme_copy_args *args), confirming current
+    Linux NVMe userspace support.
+    URL: https://raw.githubusercontent.com/linux-nvme/libnvme/master/src/nvme/ioctl.h
+
+  - PCI-SIG says PCIe 7.0 version 1.0 was released to members on 2025-06-11
+    at 128.0 GT/s.
+    URL: https://pcisig.com/specifications/pcie-70-specification-version-03-now-available-members
+
+  - PCI-SIG says PCIe 8.0 draft 0.5 targets 256.0 GT/s and up to 1.0 TB/s
+    bidirectionally over x16, full release planned by 2028.
+    URL: https://pcisig.com/specifications/pcier-80-specification-draft-05-now-available-members
+
+  - Micron positions the 9650 as a PCIe Gen6 data-center SSD with up to
+    28 GB/s sequential read and 5.5 MIOPS random read.
+    URL: https://www.micron.com/products/storage/ssd/data-center-ssd/9650-ssd
+
+Interpretation for the paper/story:
+  Host interconnect bandwidth is rising, but data-center PCIe bandwidth is
+  also power/signal-integrity constrained. Simple Copy is interesting only if
+  experiments show host CPU/DRAM/PCIe savings are not simply replaced by worse
+  device media, GC, latency, or QoS costs.
+
+
+4. Code surface and current git state
+-------------------------------------
+
+New files:
+  - /home/USER/ostudy/nvmevirt-sc/copy.h
+  - /home/USER/ostudy/nvmevirt-sc/copy.c
+  - /home/USER/ostudy/nvmevirt-sc/tests/test_simple_copy_static.py
+  - /home/USER/ostudy/nvmevirt-sc/history/260613_032649.log
+
+Changed files before this log was added:
+  - Kbuild
+  - nvme.h
+  - nvmev.h
+  - admin.c
+  - io.c
+  - simple_ftl.c
+  - conv_ftl.c
+  - ssd.c
+  - ssd.h
+  - zns_ftl.c
+  - kv_ftl.c
+
+Pre-log git status:
+  M Kbuild
+  M admin.c
+  M conv_ftl.c
+  M io.c
+  M kv_ftl.c
+  M nvme.h
+  M nvmev.h
+  M simple_ftl.c
+  M ssd.c
+  M ssd.h
+  M zns_ftl.c
+  ?? copy.c
+  ?? copy.h
+  ?? tests/
+
+Pre-log git diff --stat:
+  Kbuild       |   4 +-
+  admin.c      | 154 ++++++++++++++++++++++++++++++++++++----------
+  conv_ftl.c   | 195 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  io.c         | 139 ++++++++++++++++++++++++++++++++++++------
+  kv_ftl.c     |   3 +
+  nvme.h       |  35 +++++++++++
+  nvmev.h      |  10 +++
+  simple_ftl.c |  53 ++++++++++++++++
+  ssd.c        |  11 ++++
+  ssd.h        |   2 +
+  zns_ftl.c    |   3 +
+  11 files changed, 556 insertions(+), 53 deletions(-)
+
+After this log, history/260613_032649.log is additionally untracked unless
+the user/next agent stages or commits it.
+
+
+5. ABI and host-visible behavior
+--------------------------------
+
+Implemented:
+  - I/O opcode 0x19 as nvme_cmd_copy.
+  - NVME_CTRL_ONCS_COPY as bit 8 in Identify Controller ONCS.
+  - Command Effects Log entry for Copy with CSUPP | LBCC on NVM/conv builds.
+    Numeric observed value is 0x00000003 in this local header:
+      NVME_CMD_EFFECTS_CSUPP = 1 << 0
+      NVME_CMD_EFFECTS_LBCC  = 1 << 1
+  - Identify Namespace Copy limits at raw NVMe Identify Namespace offsets:
+      offset 74: MSSRL = 1024
+      offset 76: MCL   = 1024
+      offset 80: MSRC  = 127
+  - Identify Controller Copy Descriptor Format support bit for Format 0h using
+    the existing local reserved byte at raw offset 534.
+  - ZNS and KV do not advertise Copy.
+
+Important admin.c runtime fix added during smoke testing:
+  - Get Log Page previously ignored LPO (log page offset).
+  - This caused explicit offset reads of Command Effects Log to return the
+    first admin-effects page instead of the requested I/O-effects page.
+  - Added __copy_log_page() to honor le64_to_cpu(cmd->lpo), cap copy to one
+    page, zero-fill beyond available source bytes, and avoid stack-allocating
+    struct nvme_effects_log.
+  - Command Effects Log is now built dynamically and uses
+    nvmev_copy_supported_ns(&nvmev_vdev->ns[nsid]) instead of relying only on
+    static preprocessor initializers.
+
+Residual admin log limitation:
+  - Explicit offset read works:
+      nvme get-log /dev/nvme2 --log-id=5 --log-len=512 --lpo=1024 --raw-binary
+      copy opcode-relative dword 0x64 = 00000003
+  - Earlier full 4096-byte raw read still showed 0 at absolute offset 0x464.
+    This appears related to existing admin PRP/log transfer behavior or
+    nvme-cli/libnvme chunking. It was not fully fixed in this pass.
+  - The next agent should retest full-log behavior if full Command Effects
+    dump fidelity matters. The conformance smoke used explicit LPO chunking.
+
+
+6. Command scope
+----------------
+
+Accepted:
+  - same-namespace Simple Copy,
+  - Copy Descriptor Format 0h,
+  - 1 to 128 source ranges,
+  - at most 1024 LBAs per source range,
+  - at most 1024 LBAs total per command,
+  - FUA and Limited Retry bits are accepted; only FUA affects conv target
+    completion timing.
+
+Rejected with status:
+  - unsupported target namespace: Invalid Opcode,
+  - invalid namespace: Invalid Namespace,
+  - nonzero reserved/protection/metadata/directive fields: Invalid Field,
+  - unsupported Copy Descriptor Format: Invalid Field,
+  - oversized range count or copy length: Command Size Limit Exceeded,
+  - source/destination out of namespace bounds: LBA Out of Range,
+  - any source/destination overlap: Overlapping Range,
+  - descriptor PRP mapping failure: Data Transfer Error.
+
+
+7. Descriptor and worker safety invariants
+------------------------------------------
+
+Key invariant:
+  Descriptor PRPs are decoded once at dispatch time. The decoded range snapshot
+  is then owned by the work item until the worker performs or discards the
+  operation.
+
+Purpose:
+  Prevent host-memory time-of-check/time-of-use mismatch where FTL validates
+  one descriptor set but worker copies another descriptor set.
+
+Ownership paths:
+  - Success:
+      FTL stores decoded copy_ranges in nvmev_result.
+      __enqueue_io_req() transfers ownership to nvmev_io_work.
+      Worker frees after payload copy.
+  - Validation failure:
+      no snapshot is attached; status-gated worker performs no payload movement.
+  - Work queue allocation failure:
+      __nvmev_proc_io() frees the snapshot before returning false.
+  - Defensive path:
+      worker frees any unexpected snapshot when status is non-success.
+
+Worker data movement changes:
+  - w->status != NVME_SC_SUCCESS now prevents all host/device data movement.
+  - Copy uses __do_perform_copy(), not PRP read/write paths.
+  - Invalid namespace is checked before indexing nvmev_vdev->ns[nsid].
+  - io_size accounting is opcode-aware:
+      failures: 0
+      Copy: accepted total copied bytes
+      flush and unknown non-data commands: 0
+      read/write/zone append: existing size accounting
+
+
+8. NVM and conventional FTL model
+---------------------------------
+
+NVM target:
+  - schedules each source range as read latency,
+  - schedules destination range as contiguous write latency after all sources,
+  - performs exact host-visible backing-memory copy in worker.
+
+Conventional FTL target:
+  - validates full command before FTL mutation,
+  - allocates write buffer before FTL mutation,
+  - charges source NAND read timing for mapped/valid source pages,
+  - charges internal write-buffer timing without PCIe transfer,
+  - invalidates/remaps/programs destination pages,
+  - schedules write-buffer release for full and partial pending program groups,
+  - performs exact host-visible backing-memory copy in worker.
+
+Model boundary:
+  Backing memory copy is exact at LBA byte granularity. FTL timing and metadata
+  remain page-level, matching the existing page-mapped conv model. Partial-page
+  Copy charges touched page cost. Describe this as model granularity, not
+  hardware truth.
+
+
+9. ZNS/KV cleanup
+-----------------
+
+ZNS and KV do not implement Copy.
+
+Their default unknown-opcode paths now return NVME_SC_INVALID_OPCODE instead
+of falling through as success. This avoids false-positive results outside the
+Simple Copy scope.
+
+
+10. Static tests
+----------------
+
+Test file:
+  /home/USER/ostudy/nvmevirt-sc/tests/test_simple_copy_static.py
+
+The test suite checks:
+  - copy.o is built,
+  - opcode/status structs/constants exist,
+  - Copy limits are consistent across copy.h/copy.c,
+  - dangerous unsupported fields are rejected,
+  - supported namespace check is bounded and zero-based,
+  - admin advertisement includes ONCS, effects, namespace limit fields,
+  - admin namespace paths convert and validate nsid,
+  - simple and conv FTL hand decoded snapshots to worker,
+  - worker status gate precedes payload paths,
+  - Copy payload uses device backing store, not PRPs,
+  - internal write buffer release is not lost when work queue is full,
+  - git diff --check,
+  - build matrix across NVM, SSD, ZNS, KV.
+
+Latest explicit run:
+
+  Command:
+    python3 /home/USER/ostudy/nvmevirt-sc/tests/test_simple_copy_static.py
+
+  Result:
+    Ran 13 tests in 22.995s
+    OK
+
+The build-matrix test inside this script runs make clean/make for:
+  - default NVM,
+  - CONFIG_NVMEVIRT_SSD=y,
+  - CONFIG_NVMEVIRT_ZNS=y,
+  - CONFIG_NVMEVIRT_KV=y,
+  - final default NVM.
+
+
+11. Build and sparse verification
+---------------------------------
+
+Packages known to have been installed during the broader work:
+  - linux-headers-6.1.0-49-cloud-amd64
+  - sparse
+  - nvme-cli
+
+Build commands explicitly run and passing near final state:
+
+  make -C /home/USER/ostudy/nvmevirt-sc
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_SSD=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_ZNS=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_KV=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM=y
+
+Final build artifact was left as default NVM.
+
+Sparse:
+  Command:
+    make -C /home/USER/ostudy/nvmevirt-sc C=1
+
+  Result:
+    exit 0
+
+Important caveat:
+  Do not claim the whole repository is sparse-clean. Earlier sparse observation
+  showed pre-existing warnings/debt in other paths, mainly ZNS bitfields over
+  restricted __le32, PCI/MMIO __iomem address-space warnings, and pre-existing
+  endian/address-space queue access style. The current final make C=1 was a
+  no-op because objects were already built; earlier full sparse observation had
+  no new copy.c diagnostics but existing repo warnings remained.
+
+Whitespace:
+  Command:
+    git -C /home/USER/ostudy/nvmevirt-sc diff --check
+
+  Result:
+    exit 0, no output.
+
+
+12. GCC/user-space instability observed
+---------------------------------------
+
+Multiple user-space processes segfaulted or ICE'd during the work:
+
+  1. Codex process segfault:
+     Kernel log at 2026-06-13 00:41:24 UTC:
+       tokio-rt-worker[...] segfault ... in codex[...]
+     This happened immediately after parallel tool commands involving:
+       nvme copy --help
+       nvme effects-log /dev/nvme2
+       nvme get-log /dev/nvme2 --log-id=5 --log-len=4096 --raw-binary
+     No kernel OOPS/panic/hung task/NVMe reset was seen.
+
+  2. sudo segfault:
+     Kernel log around 2026-06-13 01:39:44 UTC:
+       sudo[...] segfault at 0 ip 0 ...
+     This was user-space, not NVMeVirt kernel crash.
+
+  3. gcc-12 internal compiler error:
+     Repeatedly hit:
+       during GIMPLE pass: reassoc
+       internal compiler error: Segmentation fault
+     Initially pointed at admin.c helper functions, then moved to main.c.
+     Workaround:
+       Kbuild now adds -fno-tree-reassoc for the module.
+
+Kbuild change:
+  /home/USER/ostudy/nvmevirt-sc/Kbuild
+    ccflags-y += -fno-tree-reassoc
+
+Reason:
+  Debian GCC 12.2 on this VM can ICE in tree-reassoc while building the module.
+
+Recommendation for next agent:
+  Treat this VM as somewhat suspicious for long experiments. Before long
+  runtime/performance runs, consider rebooting, checking dmesg/journal, and
+  possibly rebuilding with a different compiler or after package verification.
+
+
+13. Runtime smoke details
+-------------------------
+
+Runtime tests were deliberately run on a tiny, low-risk namespace:
+
+  insmod parameters:
+    sudo insmod /home/USER/ostudy/nvmevirt-sc/nvmev.ko \
+      memmap_start=0xbf6f0000 memmap_size=1088K \
+      cpus=0,1 nr_io_units=1 io_unit_shift=12 \
+      read_time=1 read_delay=1 write_time=1 write_delay=1
+
+Why this exact memory range:
+  /proc/iomem showed:
+    00100000-bf6ecfff : System RAM
+    bf6ed000-bf7ecfff : Reserved
+    bf7ed000-bf8ecfff : Unknown E820 type
+    bf8ed000-bf96cfff : Reserved
+
+Initial attempts:
+  - insmod without memmap_start failed as expected:
+      NVMeVirt: [memmap_start] should be specified
+  - memmap_start=0xbf7ed000 loaded module but host NVMe driver could not reserve
+    BAR:
+      BAR 0: can't reserve [mem 0xbf7ec000-0xbf7effff 64bit]
+    Then module was unloaded.
+  - memmap_start=0xbf6f0000 allowed host driver attach.
+
+Device after successful load:
+  - /dev/nvme2
+  - /dev/nvme2n1
+  - Size: 64K
+  - Model: CSL_Virt_MN_01
+  - Serial: CSL_Virt_SN_01
+
+Representative lsblk output:
+  NAME         MAJ:MIN  SIZE TYPE MODEL          SERIAL
+  nvme0n1      259:0     10G disk nvme_card-pd   instance-20260612-122700
+  nvme2n1      259:1     64K disk CSL_Virt_MN_01 CSL_Virt_SN_01
+
+Identify Controller smoke:
+  Command:
+    sudo /usr/sbin/nvme id-ctrl /dev/nvme2 -H
+
+  Relevant output:
+    oncs      : 0x100
+      [8:8] : 0x1 Copy Supported
+    ocfs      : 0x1
+      [1:1] : 0 Controller Copy Format 1h Not Supported
+      [0:0] : 0x1 Controller Copy Format 0h Supported
+
+Identify Namespace smoke:
+  Command:
+    sudo /usr/sbin/nvme id-ns /dev/nvme2n1 -H
+
+  Relevant output:
+    nsze    : 0x80
+    ncap    : 0x80
+    nuse    : 0x80
+    mssrl   : 1024
+    mcl     : 1024
+    msrc    : 127
+    LBA Format 0: Metadata Size 0 bytes, Data Size 512 bytes, in use
+
+Command Effects smoke:
+  Command:
+    sudo /usr/sbin/nvme get-log /dev/nvme2 \
+      --log-id=5 --log-len=512 --lpo=1024 --raw-binary \
+      > /tmp/nvmevirt_sc_effects_lpo1024_final.bin
+    od -An -tx4 -j 100 -N 4 /tmp/nvmevirt_sc_effects_lpo1024_final.bin
+
+  Output:
+    00000003
+
+  Meaning:
+    I/O Command Effects entry for opcode 0x19 is CSUPP | LBCC.
+
+
+14. Runtime Simple Copy byte-oracle tests
+-----------------------------------------
+
+Single-block success test:
+
+  Setup:
+    Source LBA 0 filled with 512 bytes of a known pattern.
+    Destination LBA 8 filled with a distinct pattern.
+
+  Command:
+    sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+      --namespace-id=1 --sdlba=8 --slbs=0 --blocks=0
+
+  Observed:
+    NVMe Copy: success
+    Destination SHA-256 after Copy matched source SHA-256.
+    COPY_ORACLE_PASS single-block
+
+Two-range success test:
+
+  Setup:
+    Source LBA 1 filled with 512 bytes of "A".
+    Source LBA 3 filled with 512 bytes of "B".
+    Destination LBAs 16-17 filled with "X".
+
+  Command:
+    sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+      --namespace-id=1 --sdlba=16 --slbs=1,3 --blocks=0,0
+
+  Observed:
+    NVMe Copy: success
+    Destination LBAs 16-17 matched concatenation A || B.
+    COPY_ORACLE_PASS two-range
+
+Overlap negative test:
+
+  Command:
+    sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+      --namespace-id=1 --sdlba=16 --slbs=16 --blocks=0
+
+  Observed:
+    NVMe status: Overlapping Range ... (0x114)
+    command exit: 1
+    Destination unchanged.
+    NEGATIVE_ORACLE_PASS overlap-unchanged
+
+Unsupported format negative test:
+
+  Command:
+    sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+      --namespace-id=1 --sdlba=20 --slbs=0 --blocks=0 --format=1
+
+  Observed:
+    NVMe status: Invalid Field in Command ... (0x2)
+    command exit: 1
+    Destination unchanged.
+    NEGATIVE_ORACLE_PASS bad-format-unchanged
+
+Final post-rebuild runtime retest:
+
+  Command:
+    same single-block copy shape using pattern "Q" and destination LBA 8.
+
+  Observed:
+    NVMe Copy: success
+    COPY_ORACLE_PASS final-single-block
+
+Runtime cleanup:
+  Command:
+    sudo rmmod nvmev
+
+  Final observed state:
+    lsmod | rg '^nvmev' returned no module.
+    lsblk showed only the boot disk /dev/nvme0n1, no /dev/nvme2n1.
+
+
+15. Current final runtime state
+-------------------------------
+
+At the time this log was created:
+  - nvmev module is unloaded.
+  - /dev/nvme2n1 is absent.
+  - only the real boot disk /dev/nvme0n1 is visible.
+  - final built module artifact is default NVM.
+
+Final lsblk state:
+  NAME         MAJ:MIN  SIZE TYPE MODEL        SERIAL                   MOUNTPOINTS
+  nvme0n1      259:0     10G disk nvme_card-pd instance-20260612-122700
+  nvme0n1p1    259:4    9.9G part                                      /
+  nvme0n1p14   259:5      3M part
+  nvme0n1p15   259:6    124M part                                      /boot/efi
+
+
+16. Known residual risks and next steps
+---------------------------------------
+
+Residual implementation risks:
+  - Full PRP-list support for descriptor buffers is not implemented. Current
+    descriptor cap is one page, so PRP1 plus direct PRP2 is enough for this
+    prototype cap, but it is not spec-complete.
+  - Admin Get Log Page full 4096-byte behavior should be retested and possibly
+    fixed with robust PRP/SGL transfer helpers. Explicit LPO chunking works.
+  - Power-fail atomicity is not modeled.
+  - Multi-namespace copy is not modeled.
+  - Metadata/protection info are intentionally rejected.
+  - Filesystem semantics are not audited. Do not claim F2FS/copy_file_range
+    support.
+  - Conventional FTL model is page-level and research-emulator grade. It does
+    not model commercial SSD firmware heuristics, ECC, SRAM pressure, firmware
+    queues, or power-fail ordering.
+
+Immediate engineering next steps:
+  1. Add robust admin/log page PRP copy helper supporting PRP1/PRP2 and
+     optionally PRP lists, then retest full 4096-byte effects log.
+  2. Add an automated runtime conformance script wrapping:
+       load/unload,
+       identify checks,
+       effects-log checks,
+       positive byte oracle,
+       negative no-mutation oracle.
+  3. Add procfs/debug counters for:
+       accepted Copy commands,
+       rejected commands by status,
+       copied logical bytes,
+       descriptor bytes read,
+       source NAND bytes,
+       destination NAND bytes,
+       host payload bytes avoided.
+  4. Run a safer full runtime session after reboot or VM health check.
+  5. Only then begin microbenchmark work.
+
+Experiment controls needed before paper claims:
+  - byte-for-byte oracle after every Copy operation,
+  - invalid/out-of-bounds/overlap negative controls,
+  - host read+write baseline,
+  - optimized host direct-I/O baseline,
+  - CPU cycles, DRAM bandwidth, PCIe bytes if available,
+  - device latency/tail latency and interference windows,
+  - clear separation of host savings from target media work.
+
+Claims to avoid:
+  - "Simple Copy always improves performance."
+  - "This proves F2FS/copy_file_range should use NVMe Copy."
+  - "This matches commercial SSD behavior."
+  - "This is power-fail atomic."
+  - "This eliminates PCIe bottlenecks in general."
+  - "Cloud VM results prove physical SSD behavior."
+
+
+17. Useful commands for next agent
+----------------------------------
+
+Build default NVM:
+  make -C /home/USER/ostudy/nvmevirt-sc
+
+Run static tests:
+  python3 /home/USER/ostudy/nvmevirt-sc/tests/test_simple_copy_static.py
+
+Build matrix manually:
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_SSD=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_ZNS=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM= CONFIG_NVMEVIRT_KV=y
+  make -C /home/USER/ostudy/nvmevirt-sc CONFIG_NVMEVIRT_NVM=y
+
+Runtime load used in smoke:
+  sudo insmod /home/USER/ostudy/nvmevirt-sc/nvmev.ko \
+    memmap_start=0xbf6f0000 memmap_size=1088K \
+    cpus=0,1 nr_io_units=1 io_unit_shift=12 \
+    read_time=1 read_delay=1 write_time=1 write_delay=1
+
+Runtime unload:
+  sudo rmmod nvmev
+
+Identify checks:
+  sudo /usr/sbin/nvme id-ctrl /dev/nvme2 -H
+  sudo /usr/sbin/nvme id-ns /dev/nvme2n1 -H
+
+Effects offset check:
+  sudo /usr/sbin/nvme get-log /dev/nvme2 \
+    --log-id=5 --log-len=512 --lpo=1024 --raw-binary \
+    > /tmp/nvmevirt_sc_effects_lpo1024.bin
+  od -An -tx4 -j 100 -N 4 /tmp/nvmevirt_sc_effects_lpo1024.bin
+
+Expected effects output:
+  00000003
+
+Single-block Copy command:
+  sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+    --namespace-id=1 --sdlba=8 --slbs=0 --blocks=0
+
+Overlap negative command:
+  sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+    --namespace-id=1 --sdlba=16 --slbs=16 --blocks=0
+
+Bad format negative command:
+  sudo /usr/sbin/nvme copy /dev/nvme2n1 \
+    --namespace-id=1 --sdlba=20 --slbs=0 --blocks=0 --format=1
+
+
+18. Bottom line for handoff
+---------------------------
+
+The current code is strong enough for a careful prototype story:
+  - bounded Simple Copy path,
+  - host-visible Identify advertisement,
+  - Command Effects Copy entry observable via explicit offset read,
+  - descriptor validation and snapshot ownership,
+  - status-gated worker data movement,
+  - exact byte-oracle success for single and multi-range runtime smoke,
+  - representative negative cases return errors and leave destination unchanged,
+  - conv FTL cost modeling exists for device-side source read/destination write.
+
+It is not yet strong enough for:
+  - production SSD firmware claims,
+  - filesystem-level acceleration claims,
+  - power-fail/crash consistency claims,
+  - universal performance benefit claims,
+  - spec-complete admin/log PRP behavior.
+
+Next agent should start by reading:
+  1. /home/USER/ostudy/_temp/simple_copy_repo_and_experiment_plan.md
+  2. /home/USER/ostudy/nvmevirt-sc/copy.h
+  3. /home/USER/ostudy/nvmevirt-sc/copy.c
+  4. /home/USER/ostudy/nvmevirt-sc/admin.c around Get Log/Identify
+  5. /home/USER/ostudy/nvmevirt-sc/io.c around status gate and __do_perform_copy
+  6. /home/USER/ostudy/nvmevirt-sc/simple_ftl.c and conv_ftl.c Copy paths
+  7. /home/USER/ostudy/nvmevirt-sc/tests/test_simple_copy_static.py
+

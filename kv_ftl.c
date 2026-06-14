@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/ktime.h>
+#include <linux/errno.h>
 #include <linux/highmem.h>
+#include <linux/io.h>
 #include <linux/sched/clock.h>
+#include <linux/slab.h>
 
 #include "nvmev.h"
 #include "kv_ftl.h"
@@ -18,6 +21,182 @@ static const struct allocator_ops bitmap_ops = {
 	.allocate = bitmap_allocate,
 	.kill = bitmap_kill,
 };
+
+struct kv_prp_mapping {
+	void *base;
+	void *addr;
+	bool memremap;
+};
+
+#define NVMEV_KV_PRPS_PER_PAGE (PAGE_SIZE / sizeof(__le64))
+
+static bool __kv_map_prp_page(u64 paddr, struct kv_prp_mapping *map)
+{
+	u64 base = paddr & PAGE_MASK;
+	size_t offset = paddr & PAGE_OFFSET_MASK;
+
+	if (!paddr)
+		return false;
+
+	map->base = NULL;
+	map->addr = NULL;
+	map->memremap = false;
+
+	if (pfn_valid(base >> PAGE_SHIFT)) {
+		map->base = kmap_atomic_pfn(PRP_PFN(base));
+	} else {
+		map->base = memremap(base, PAGE_SIZE, MEMREMAP_WT);
+		map->memremap = true;
+	}
+
+	if (!map->base)
+		return false;
+
+	map->addr = (u8 *)map->base + offset;
+	return true;
+}
+
+static void __kv_unmap_prp_page(struct kv_prp_mapping *map)
+{
+	if (!map->base)
+		return;
+
+	if (map->memremap)
+		memunmap(map->base);
+	else
+		kunmap_atomic(map->base);
+
+	map->base = NULL;
+	map->addr = NULL;
+	map->memremap = false;
+}
+
+static int __kv_transfer_prp_data_page(u64 paddr, void *buffer, size_t len,
+				       size_t *copied, bool allow_offset,
+				       bool buffer_to_prp)
+{
+	struct kv_prp_mapping map;
+	size_t page_offs = paddr & PAGE_OFFSET_MASK;
+	size_t copy_len;
+
+	if (*copied >= len)
+		return 0;
+	if (!paddr)
+		return -EFAULT;
+	if (!allow_offset && page_offs)
+		return -EFAULT;
+
+	if (!__kv_map_prp_page(paddr, &map))
+		return -EFAULT;
+
+	copy_len = min_t(size_t, len - *copied, PAGE_SIZE - page_offs);
+	if (buffer_to_prp)
+		memcpy(map.addr, (u8 *)buffer + *copied, copy_len);
+	else
+		memcpy((u8 *)buffer + *copied, map.addr, copy_len);
+
+	__kv_unmap_prp_page(&map);
+	*copied += copy_len;
+	return 0;
+}
+
+static int __kv_transfer_prp_list(u64 list_paddr, void *buffer, size_t len,
+				  size_t *copied, bool buffer_to_prp)
+{
+	u32 guard = 0;
+	u32 max_lists = DIV_ROUND_UP(DIV_ROUND_UP(len, PAGE_SIZE),
+				     NVMEV_KV_PRPS_PER_PAGE - 1) + 1;
+
+	if (!list_paddr || (list_paddr & PAGE_OFFSET_MASK))
+		return -EFAULT;
+
+	while (*copied < len) {
+		struct kv_prp_mapping map;
+		__le64 *entries;
+		u64 next_list = 0;
+		u32 i;
+		int ret = 0;
+
+		if (++guard > max_lists)
+			return -EFAULT;
+
+		entries = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!entries)
+			return -ENOMEM;
+
+		if (!__kv_map_prp_page(list_paddr, &map)) {
+			kfree(entries);
+			return -EFAULT;
+		}
+
+		memcpy(entries, map.addr, PAGE_SIZE);
+		__kv_unmap_prp_page(&map);
+
+		for (i = 0; i < NVMEV_KV_PRPS_PER_PAGE && *copied < len; i++) {
+			u64 paddr = le64_to_cpu(entries[i]);
+
+			if (!paddr) {
+				ret = -EFAULT;
+				break;
+			}
+
+			if (i == NVMEV_KV_PRPS_PER_PAGE - 1 &&
+			    *copied + PAGE_SIZE < len) {
+				next_list = paddr;
+				break;
+			}
+
+			ret = __kv_transfer_prp_data_page(paddr, buffer, len,
+							 copied, false,
+							 buffer_to_prp);
+			if (ret)
+				break;
+		}
+
+		kfree(entries);
+		if (ret)
+			return ret;
+		if (next_list) {
+			if (next_list & PAGE_OFFSET_MASK)
+				return -EFAULT;
+			list_paddr = next_list;
+			continue;
+		}
+		if (*copied < len)
+			return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int __kv_transfer_prp(u64 prp1, u64 prp2, void *buffer, size_t len,
+			     bool buffer_to_prp)
+{
+	size_t copied = 0;
+	int ret;
+
+	if (!len)
+		return 0;
+
+	ret = __kv_transfer_prp_data_page(prp1, buffer, len, &copied, true,
+					 buffer_to_prp);
+	if (ret || copied == len)
+		return ret;
+
+	if (len - copied <= PAGE_SIZE)
+		return __kv_transfer_prp_data_page(prp2, buffer, len, &copied,
+						   false, buffer_to_prp);
+
+	return __kv_transfer_prp_list(prp2, buffer, len, &copied, buffer_to_prp);
+}
+
+static int __kv_transfer_value_prp(struct nvme_kv_command cmd, void *buffer,
+				   size_t len, bool buffer_to_prp)
+{
+	return __kv_transfer_prp(le64_to_cpu(kv_io_cmd_value_prp(cmd, 1)),
+				 le64_to_cpu(kv_io_cmd_value_prp(cmd, 2)),
+				 buffer, len, buffer_to_prp);
+}
 
 static inline unsigned long long __get_wallclock(void)
 {
@@ -54,6 +233,27 @@ static unsigned int cmd_value_length(struct nvme_kv_command cmd)
 	} else {
 		return cmd.kv_store.value_len << 2;
 	}
+}
+
+static bool kv_cmd_inline_key_supported(struct nvme_kv_command cmd, unsigned int *status)
+{
+	unsigned int key_len;
+
+	if (cmd.common.opcode != nvme_cmd_kv_store &&
+	    cmd.common.opcode != nvme_cmd_kv_retrieve &&
+	    cmd.common.opcode != nvme_cmd_kv_delete &&
+	    cmd.common.opcode != nvme_cmd_kv_exist)
+		return true;
+
+	key_len = cmd_key_length(cmd);
+	if (!key_len || key_len > KVCMD_INLINE_KEY_MAX) {
+		NVMEV_ERROR("unsupported KV key length %u for opcode 0x%x\n",
+			    key_len, cmd.common.opcode);
+		*status = NVME_SC_INVALID_FIELD;
+		return false;
+	}
+
+	return true;
 }
 
 /* Return the time to complete */
@@ -506,15 +706,13 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				       unsigned int *status)
 {
 	size_t offset;
-	size_t length, remaining;
-	int prp_offs = 0;
-	int prp2_offs = 0;
-	u64 paddr;
-	u64 *paddr_list = NULL;
-	size_t mem_offs = 0;
+	size_t length;
 	size_t new_offset = 0;
 	struct mapping_entry entry;
 	int is_insert = 0;
+
+	if (!kv_cmd_inline_key_supported(cmd, status))
+		return 0;
 
 	entry = get_mapping_entry(kv_ftl, cmd);
 	offset = entry.mem_offset;
@@ -580,52 +778,19 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 
 		return 0;
 	}
-	remaining = length;
-
-	while (remaining) {
-		size_t io_size;
-		void *vaddr;
-
-		mem_offs = 0;
-		prp_offs++;
-		if (prp_offs == 1) {
-			paddr = kv_io_cmd_value_prp(cmd, 1);
-		} else if (prp_offs == 2) {
-			paddr = kv_io_cmd_value_prp(cmd, 2);
-			if (remaining > PAGE_SIZE) {
-				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-					     (paddr & PAGE_OFFSET_MASK);
-				paddr = paddr_list[prp2_offs++];
-			}
-		} else {
-			paddr = paddr_list[prp2_offs++];
+	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		if (__kv_transfer_value_prp(cmd, nvmev_vdev->storage_mapped + offset,
+					    length, false)) {
+			*status = NVME_SC_DATA_XFER_ERROR;
+			return 0;
 		}
-
-		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
-
-		io_size = min_t(size_t, remaining, PAGE_SIZE);
-
-		if (paddr & PAGE_OFFSET_MASK) { // 일반 block io면 언제 여기에 해당?
-			mem_offs = paddr & PAGE_OFFSET_MASK;
-			if (io_size + mem_offs > PAGE_SIZE)
-				io_size = PAGE_SIZE - mem_offs;
+	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
+		if (__kv_transfer_value_prp(cmd, nvmev_vdev->storage_mapped + offset,
+					    length, true)) {
+			*status = NVME_SC_DATA_XFER_ERROR;
+			return 0;
 		}
-		if (cmd.common.opcode == nvme_cmd_kv_store) {
-			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
-		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
-		} else {
-			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
-		}
-
-		kunmap_atomic(vaddr);
-
-		remaining -= io_size;
-		offset += io_size;
 	}
-
-	if (paddr_list != NULL)
-		kunmap_atomic(paddr_list);
 
 	if (is_insert == 1) { // need to make new mapping
 		new_mapping_entry(kv_ftl, cmd, new_offset);
@@ -691,13 +856,7 @@ static unsigned int __do_perform_kv_batched_io(struct kv_ftl *kv_ftl, int opcode
 static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
 					  unsigned int *status)
 {
-	size_t offset;
-	size_t length, remaining;
-	int prp_offs = 0;
-	int prp2_offs = 0;
-	u64 paddr;
-	u64 *paddr_list = NULL;
-	size_t mem_offs = 0;
+	size_t length;
 	int i;
 	struct payload_format *payload;
 	char *buffer = NULL;
@@ -708,52 +867,24 @@ static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_
 
 	sub_cmd_cnt = cmd.kv_batch.rsvd4;
 	length = cmd_value_length(cmd);
+	if (sub_cmd_cnt < 0 || sub_cmd_cnt > MAX_SUB_CMD ||
+	    length < sizeof(struct batch_cmd_head)) {
+		*status = NVME_SC_INVALID_FIELD;
+		return 0;
+	}
 
 	value = kmalloc(4097, GFP_KERNEL);
 	buffer = kmalloc(length, GFP_KERNEL);
+	if (!value || !buffer) {
+		*status = NVME_SC_INTERNAL;
+		goto out;
+	}
 
 	//printk("kv_batch %d %d", sub_cmd_cnt, length);
 
-	remaining = length;
-	offset = 0;
-
-	while (remaining) {
-		size_t io_size;
-		void *vaddr;
-
-		mem_offs = 0;
-		prp_offs++;
-		if (prp_offs == 1) {
-			paddr = kv_io_cmd_value_prp(cmd, 1);
-		} else if (prp_offs == 2) {
-			paddr = kv_io_cmd_value_prp(cmd, 2);
-			if (remaining > PAGE_SIZE) {
-				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-					     (paddr & PAGE_OFFSET_MASK);
-				paddr = paddr_list[prp2_offs++];
-			}
-		} else {
-			paddr = paddr_list[prp2_offs++];
-		}
-
-		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
-
-		io_size = min_t(size_t, remaining, PAGE_SIZE);
-
-		if (paddr & PAGE_OFFSET_MASK) { // 일반 block io면 언제 여기에 해당?
-			mem_offs = paddr & PAGE_OFFSET_MASK;
-			if (io_size + mem_offs > PAGE_SIZE)
-				io_size = PAGE_SIZE - mem_offs;
-		}
-
-		NVMEV_DEBUG("Value write length %lu to position %lu, io size: %ld, mem_off: %lu\n",
-			    remaining, offset, io_size, mem_offs);
-		memcpy(buffer + offset, vaddr + mem_offs, io_size);
-
-		kunmap_atomic(vaddr);
-
-		remaining -= io_size;
-		offset += io_size;
+	if (__kv_transfer_value_prp(cmd, buffer, length, false)) {
+		*status = NVME_SC_DATA_XFER_ERROR;
+		goto out;
 	}
 
 	/* perform KV IO for sub-payload */
@@ -766,9 +897,18 @@ static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_
 		opcode = payload->batch_head.attr[i].opcode;
 		key_len = payload->batch_head.attr[i].keySize;
 		val_len = payload->batch_head.attr[i].valueSize;
+		if (key_len <= 0 || key_len > KVCMD_INLINE_KEY_MAX ||
+		    val_len < 0 || val_len > 4096) {
+			*status = NVME_SC_INVALID_FIELD;
+			goto out;
+		}
 		sub_len += ((key_len - 1) / ALIGN_LEN + 1) * ALIGN_LEN;
 		sub_len += ((val_len - 1) / ALIGN_LEN + 1) * ALIGN_LEN;
 		sub_len += ALIGN_LEN;
+		if (payload_offset + sub_len > length) {
+			*status = NVME_SC_INVALID_FIELD;
+			goto out;
+		}
 
 		memcpy(key, payload->sub_payload + payload_offset, key_len);
 		memcpy(value,
@@ -784,9 +924,7 @@ static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_
 
 	NVMEV_DEBUG("finished kv_batch with %d sub-commands", sub_cmd_cnt);
 
-	if (paddr_list != NULL)
-		kunmap_atomic(paddr_list);
-
+out:
 	if (value != NULL)
 		kfree(value);
 
@@ -801,7 +939,7 @@ static unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 	int iter = 0;
 	bool flag = false;
 
-	for (iter = 1; iter <= 16; iter++) {
+	for (iter = 1; iter < ARRAY_SIZE(kv_ftl->iter_handle); iter++) {
 		if (kv_ftl->iter_handle[iter] == NULL) {
 			flag = true;
 			break;
@@ -812,7 +950,17 @@ static unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 		return 1;
 
 	kv_ftl->iter_handle[iter] = kmalloc(sizeof(struct kv_iter_context), GFP_KERNEL);
+	if (!kv_ftl->iter_handle[iter]) {
+		*status = NVME_SC_INTERNAL;
+		return 0;
+	}
 	kv_ftl->iter_handle[iter]->buf = kmalloc(32768, GFP_KERNEL);
+	if (!kv_ftl->iter_handle[iter]->buf) {
+		kfree(kv_ftl->iter_handle[iter]);
+		kv_ftl->iter_handle[iter] = NULL;
+		*status = NVME_SC_INTERNAL;
+		return 0;
+	}
 	kv_ftl->iter_handle[iter]->end = 0;
 	kv_ftl->iter_handle[iter]->byteswritten = 0;
 	kv_ftl->iter_handle[iter]->bufoffset = 0;
@@ -827,6 +975,11 @@ static unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 static unsigned int kv_iter_close(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd, unsigned int *status)
 {
 	int iter = cmd.kv_iter_req.iter_handle;
+
+	if (iter <= 0 || iter >= ARRAY_SIZE(kv_ftl->iter_handle)) {
+		*status = NVME_SC_INVALID_FIELD;
+		return 0;
+	}
 
 	if (kv_ftl->iter_handle[iter]) {
 		kfree(kv_ftl->iter_handle[iter]->buf);
@@ -843,17 +996,20 @@ static unsigned int kv_iter_read(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 				 unsigned int *status)
 {
 	int iter = cmd.kv_iter_req.iter_handle;
-	struct kv_iter_context *handle = kv_ftl->iter_handle[iter];
+	struct kv_iter_context *handle;
 	int pos = 0, keylen = 16, buf_offset = 4, nr_keys = 0;
 	unsigned int key;
 	bool full = false, end = false;
-	size_t remaining, mem_offs = 0, offset;
-	int prp_offs = 0, prp2_offs = 0;
-	u64 paddr;
-	u64 *paddr_list = NULL;
 
+	if (iter <= 0 || iter >= ARRAY_SIZE(kv_ftl->iter_handle)) {
+		*status = NVME_SC_INVALID_FIELD;
+		return 0;
+	}
+
+	handle = kv_ftl->iter_handle[iter];
 	if (handle == NULL) {
 		NVMEV_ERROR("Invalid Iterator Handle");
+		*status = NVME_SC_INVALID_FIELD;
 		return 0;
 	}
 
@@ -892,52 +1048,10 @@ static unsigned int kv_iter_read(struct kv_ftl *kv_ftl, struct nvme_kv_command c
 	NVMEV_DEBUG("Iterator read done, buf_offset %d, pos %d", buf_offset, pos);
 	handle->current_pos = pos;
 
-	/* Writing buffer to PRP */
-	remaining = buf_offset;
-	offset = 0;
-
-	while (remaining) {
-		size_t io_size;
-		void *vaddr;
-
-		mem_offs = 0;
-		prp_offs++;
-		if (prp_offs == 1) {
-			paddr = kv_io_cmd_value_prp(cmd, 1);
-		} else if (prp_offs == 2) {
-			paddr = kv_io_cmd_value_prp(cmd, 2);
-			if (remaining > PAGE_SIZE) {
-				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-					     (paddr & PAGE_OFFSET_MASK);
-				paddr = paddr_list[prp2_offs++];
-			}
-		} else {
-			paddr = paddr_list[prp2_offs++];
-		}
-
-		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
-
-		io_size = min_t(size_t, remaining, PAGE_SIZE);
-
-		if (paddr & PAGE_OFFSET_MASK) {
-			mem_offs = paddr & PAGE_OFFSET_MASK;
-			if (io_size + mem_offs > PAGE_SIZE)
-				io_size = PAGE_SIZE - mem_offs;
-		}
-
-		NVMEV_DEBUG(
-			"Buffer transfer, length %lu from position %lu, io size: %ld, mem_off: %lu\n",
-			remaining, offset, io_size, mem_offs);
-		memcpy(vaddr + mem_offs, handle->buf + offset, io_size);
-
-		kunmap_atomic(vaddr);
-
-		remaining -= io_size;
-		offset += io_size;
+	if (__kv_transfer_value_prp(cmd, handle->buf, buf_offset, true)) {
+		*status = NVME_SC_DATA_XFER_ERROR;
+		return 0;
 	}
-
-	if (paddr_list != NULL)
-		kunmap_atomic(paddr_list);
 
 	*status = 0;
 	if (end) {
@@ -989,6 +1103,9 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
 				nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+		ret->status = NVME_SC_INVALID_OPCODE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
 		break;
 	}
 
@@ -1055,7 +1172,7 @@ void kv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *ma
 		kv_ftl->kv_mapping_table[i].length = -1;
 	}
 
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < ARRAY_SIZE(kv_ftl->iter_handle); i++)
 		kv_ftl->iter_handle[i] = NULL;
 
 	ns->id = id;

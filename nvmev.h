@@ -3,6 +3,7 @@
 #ifndef _LIB_NVMEV_H
 #define _LIB_NVMEV_H
 
+#include <linux/atomic.h>
 #include <linux/pci.h>
 #include <linux/msi.h>
 #include <asm/apic.h>
@@ -81,7 +82,46 @@
 #define BITMASK64_ALL (0xFFFFFFFFFFFFFFFF)
 #define ASSERT(X)
 
+#define NVMEV_COPY_STATUS_BUCKETS 1024
+
 #include "ssd_config.h"
+#include <linux/mutex.h>
+
+struct nvmev_copy_range;
+
+struct nvmev_copy_stat {
+	atomic64_t submitted;
+	atomic64_t succeeded;
+	atomic64_t failed;
+	atomic64_t logical_bytes;
+	atomic64_t descriptor_bytes;
+	atomic64_t source_read_bytes;
+	atomic64_t destination_write_bytes;
+	atomic64_t host_payload_avoided_bytes;
+	atomic64_t backing_memcpy_bytes;
+	atomic64_t status[NVMEV_COPY_STATUS_BUCKETS];
+	atomic64_t status_overflow;
+};
+
+struct nvmev_opcode_latency_stat {
+	/*
+	 * wall_* fields are measured in the dispatcher CPU clock domain.
+	 * model_ns is the NVMeVirt timing-model delay returned by the FTL.
+	 */
+	atomic64_t inflight;
+	atomic64_t max_inflight;
+	atomic64_t completions;
+	atomic64_t wall_completion_ns;
+	atomic64_t wall_queue_ns;
+	atomic64_t wall_payload_ns;
+	atomic64_t model_ns;
+	atomic64_t wall_after_model_ns;
+	atomic64_t max_wall_completion_ns;
+	atomic64_t max_wall_queue_ns;
+	atomic64_t max_wall_payload_ns;
+	atomic64_t max_model_ns;
+	atomic64_t max_wall_after_model_ns;
+};
 
 struct nvmev_sq_stat {
 	unsigned int nr_dispatched;
@@ -175,6 +215,9 @@ struct nvmev_io_work {
 
 	int sq_entry;
 	unsigned int command_id;
+	unsigned int opcode;
+	uint32_t nsid;
+	struct nvme_command command;
 
 	unsigned long long nsecs_start;
 	unsigned long long nsecs_target;
@@ -194,6 +237,11 @@ struct nvmev_io_work {
 	bool is_internal;
 	void *write_buffer;
 	size_t buffs_to_release;
+
+	uint64_t copy_sdlba;
+	uint32_t copy_nr_ranges;
+	uint64_t copy_expected_bytes;
+	struct nvmev_copy_range *copy_ranges;
 
 	unsigned int next, prev;
 };
@@ -252,15 +300,24 @@ struct nvmev_dev {
 	struct nvmev_completion_queue *cqes[NR_MAX_IO_QUEUE + 1];
 
 	unsigned int mdts;
+	atomic_t quiescing;
+	atomic_t copy_prp_fault_once;
 
 	struct proc_dir_entry *proc_root;
 	struct proc_dir_entry *proc_read_times;
 	struct proc_dir_entry *proc_write_times;
 	struct proc_dir_entry *proc_io_units;
 	struct proc_dir_entry *proc_stat;
+	struct proc_dir_entry *proc_copy_stat;
+	struct proc_dir_entry *proc_worker_stat;
+	struct proc_dir_entry *proc_latency_stat;
 	struct proc_dir_entry *proc_debug;
 
 	unsigned long long *io_unit_stat;
+	atomic64_t opcode_cmds[256];
+	atomic64_t opcode_bytes[256];
+	struct nvmev_opcode_latency_stat opcode_latency[256];
+	struct nvmev_copy_stat copy_stat;
 };
 
 struct nvmev_request {
@@ -271,8 +328,16 @@ struct nvmev_request {
 
 struct nvmev_result {
 	uint32_t status;
+	uint64_t bytes;
 	uint64_t nsecs_target;
 	uint64_t result;   /* for Zone Append: allocated SLBA */
+	uint64_t copy_sdlba;
+	uint32_t copy_nr_ranges;
+	uint64_t copy_desc_bytes;
+	uint64_t copy_source_read_bytes;
+	uint64_t copy_destination_write_bytes;
+	uint64_t copy_host_payload_avoided_bytes;
+	struct nvmev_copy_range *copy_ranges;
 };
 
 struct nvmev_ns {
@@ -280,6 +345,7 @@ struct nvmev_ns {
 	uint32_t csi;
 	uint64_t size;
 	void *mapped;
+	struct mutex storage_lock;
 
 	/*conv ftl or zns or kv*/
 	uint32_t nr_parts; // partitions
@@ -314,6 +380,7 @@ void nvmev_proc_admin_cq(int new_db, int old_db);
 struct buffer;
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 				struct buffer *write_buffer, size_t buffs_to_release);
+bool nvmev_io_drain(struct nvmev_dev *dev, unsigned long timeout_ms);
 void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev);
 int nvmev_proc_io_sq(int qid, int new_db, int old_db);

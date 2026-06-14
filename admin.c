@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/slab.h>
+
 #include "nvmev.h"
 #include "conv_ftl.h"
 #include "zns_ftl.h"
+#include "copy.h"
 
 #define sq_entry(entry_id) \
 	queue->nvme_sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
@@ -185,12 +188,33 @@ static void __nvmev_admin_delete_sq(int eid)
 /***
  * Log pages
  */
+static void __copy_log_page(void *dst, const void *src, size_t src_len,
+			    uint32_t len, uint64_t offset)
+{
+	const u8 *src_bytes = src;
+	u8 *dst_bytes = dst;
+	uint32_t capped_len = len > PAGE_SIZE ? PAGE_SIZE : len;
+	uint32_t copy_len = 0;
+
+	if (src && offset < src_len) {
+		uint64_t remaining = src_len - offset;
+
+		copy_len = remaining > capped_len ? capped_len : remaining;
+		memcpy(dst_bytes, src_bytes + offset, copy_len);
+	}
+
+	if (copy_len < capped_len)
+		memset(dst_bytes + copy_len, 0, capped_len - copy_len);
+}
+
 static void __nvmev_admin_get_log_page(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_get_log_page_command *cmd = &sq_entry(eid).get_log_page;
 	void *page;
-	uint32_t len = ((((uint32_t)cmd->numdu << 16) | cmd->numdl) + 1) << 2;
+	uint32_t len = ((((uint32_t)le16_to_cpu(cmd->numdu) << 16) |
+			 le16_to_cpu(cmd->numdl)) + 1) << 2;
+	uint64_t offset = le64_to_cpu(cmd->lpo);
 
 	page = prp_address(cmd->prp1);
 
@@ -206,37 +230,69 @@ static void __nvmev_admin_get_log_page(int eid)
 			.temperature[1] = (0 >> 8) & 0xff,
 		};
 
-		__memcpy(page, &smart_log, len);
+		__copy_log_page(page, &smart_log, sizeof(smart_log), len, offset);
 		break;
 	}
 	case NVME_LOG_CMD_EFFECTS: {
-		static const struct nvme_effects_log effects_log = {
-			.acs = {
-				[nvme_admin_get_log_page] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				[nvme_admin_identify] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				// [nvme_admin_abort_cmd] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				[nvme_admin_set_features] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				[nvme_admin_get_features] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				[nvme_admin_async_event] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				// [nvme_admin_keep_alive] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-			},
-			.iocs = {
-#if SUPPORTED_SSD_TYPE(ZNS)
-				/*
-				 * Zone Append is unsupported at the moment, but we fake it so that
-				 * Linux device driver doesn't lock it to R/O.
-				 *
-				 * A zone append command will result in device failure.
-				 */
-				[nvme_cmd_zone_append] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-				[nvme_cmd_zone_mgmt_send] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC),
-				[nvme_cmd_zone_mgmt_recv] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
-#endif
-			},
-			.resv = { 0, },
-		};
+		struct nvme_effects_log *effects_log;
+		int nsid;
 
-		__memcpy(page, &effects_log, len);
+		effects_log = kzalloc(sizeof(*effects_log), GFP_KERNEL);
+		if (!effects_log) {
+			__make_cq_entry(eid, NVME_SC_INTERNAL);
+			return;
+		}
+
+		effects_log->acs[nvme_admin_get_log_page] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		effects_log->acs[nvme_admin_identify] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		// effects_log->acs[nvme_admin_abort_cmd] =
+		//	cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		effects_log->acs[nvme_admin_set_features] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		effects_log->acs[nvme_admin_get_features] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		effects_log->acs[nvme_admin_async_event] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		// effects_log->acs[nvme_admin_keep_alive] =
+		//	cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+
+	#if (SUPPORTED_SSD_TYPE(NVM) || SUPPORTED_SSD_TYPE(CONV))
+			effects_log->iocs[nvme_cmd_copy] =
+				cpu_to_le32(NVME_CMD_EFFECTS_CSUPP |
+					    NVME_CMD_EFFECTS_LBCC);
+	#else
+			for (nsid = 0; nsid < nvmev_vdev->nr_ns; nsid++) {
+				if (!nvmev_copy_supported_ns(&nvmev_vdev->ns[nsid]))
+					continue;
+
+				effects_log->iocs[nvme_cmd_copy] =
+					cpu_to_le32(NVME_CMD_EFFECTS_CSUPP |
+						    NVME_CMD_EFFECTS_LBCC);
+				break;
+			}
+	#endif
+
+#if SUPPORTED_SSD_TYPE(ZNS)
+		/*
+		 * Zone Append is unsupported at the moment, but we fake it so that
+		 * Linux device driver doesn't lock it to R/O.
+		 *
+		 * A zone append command will result in device failure.
+		 */
+		effects_log->iocs[nvme_cmd_zone_append] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		effects_log->iocs[nvme_cmd_zone_mgmt_send] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP |
+				    NVME_CMD_EFFECTS_LBCC);
+		effects_log->iocs[nvme_cmd_zone_mgmt_recv] =
+			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+#endif
+
+		__copy_log_page(page, effects_log, sizeof(*effects_log), len,
+				offset);
+		kfree(effects_log);
 		break;
 	}
 	default:
@@ -252,7 +308,7 @@ static void __nvmev_admin_get_log_page(int eid)
 		 */
 		NVMEV_ERROR("Unimplemented log page identifier: 0x%hhx,"
 			    "the system will be unstable!\n", cmd->lid);
-		__memset(page, 0, len);
+		__copy_log_page(page, NULL, 0, len, offset);
 		break;
 	}
 
@@ -268,10 +324,17 @@ static void __nvmev_admin_identify_namespace(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_id_ns *ns;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
-	size_t nsid = cmd->nsid - 1;
+	uint32_t nsid_raw = le32_to_cpu(cmd->nsid);
+	size_t nsid;
 
 	ns = prp_address(cmd->prp1);
 	memset(ns, 0x0, PAGE_SIZE);
+
+	if (nsid_raw == 0 || nsid_raw > nvmev_vdev->nr_ns) {
+		__make_cq_entry(eid, NVME_SC_INVALID_NS);
+		return;
+	}
+	nsid = nsid_raw - 1;
 
 	ns->lbaf[0].ms = 0;
 	ns->lbaf[0].ds = 9;
@@ -316,6 +379,12 @@ static void __nvmev_admin_identify_namespace(int eid)
 	ns->ncap = ns->nsze;
 	ns->nuse = ns->nsze;
 
+	if (nvmev_copy_supported_ns(&nvmev_vdev->ns[nsid])) {
+		ns->mssrl = cpu_to_le16(NVMEV_COPY_MSSRL);
+		ns->mcl = cpu_to_le32(NVMEV_COPY_MCL);
+		ns->msrc = NVMEV_COPY_MSRC;
+	}
+
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
@@ -324,13 +393,14 @@ static void __nvmev_admin_identify_namespaces(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	unsigned int *ns;
+	uint32_t nsid = le32_to_cpu(cmd->nsid);
 	int i;
 
 	ns = prp_address(cmd->prp1);
 	memset(ns, 0x00, PAGE_SIZE * 2);
 
 	for (i = 1; i <= nvmev_vdev->nr_ns; i++) {
-		if (i > cmd->nsid) {
+		if (i > nsid) {
 			*ns = i;
 			ns++;
 		}
@@ -344,10 +414,17 @@ static void __nvmev_admin_identify_namespace_desc(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	struct nvme_id_ns_desc *ns_desc;
-	int nsid = cmd->nsid - 1;
+	uint32_t nsid_raw = le32_to_cpu(cmd->nsid);
+	int nsid;
 
 	ns_desc = prp_address(cmd->prp1);
 	memset(ns_desc, 0x00, sizeof(*ns_desc));
+
+	if (nsid_raw == 0 || nsid_raw > nvmev_vdev->nr_ns) {
+		__make_cq_entry(eid, NVME_SC_INVALID_NS);
+		return;
+	}
+	nsid = nsid_raw - 1;
 
 	ns_desc->nidt = NVME_NIDT_CSI;
 	ns_desc->nidl = 1;
@@ -362,15 +439,25 @@ static void __nvmev_admin_identify_zns_namespace(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_identify *cmd = &sq_entry(eid).identify;
 	struct nvme_id_zns_ns *ns;
-	int nsid = cmd->nsid - 1;
-	struct zns_ftl *zns_ftl = (struct zns_ftl *)nvmev_vdev->ns[nsid].ftls;
-	struct znsparams *zpp = &zns_ftl->zp;
+	uint32_t nsid_raw = le32_to_cpu(cmd->nsid);
+	int nsid;
+	struct zns_ftl *zns_ftl;
+	struct znsparams *zpp;
+
+	if (nsid_raw == 0 || nsid_raw > nvmev_vdev->nr_ns) {
+		__make_cq_entry(eid, NVME_SC_INVALID_NS);
+		return;
+	}
+	nsid = nsid_raw - 1;
 
 	if (NS_SSD_TYPE(nsid) != SSD_TYPE_ZNS) {
 		__make_cq_entry(eid, NVME_SC_SUCCESS);
 		return;
 	}
 	BUG_ON(nvmev_vdev->ns[nsid].csi != NVME_CSI_ZNS);
+
+	zns_ftl = (struct zns_ftl *)nvmev_vdev->ns[nsid].ftls;
+	zpp = &zns_ftl->zp;
 
 	ns = prp_address(cmd->prp1);
 	memset(ns, 0x00, sizeof(*ns));
@@ -426,7 +513,12 @@ static void __nvmev_admin_identify_ctrl(int eid)
 	memset(ctrl, 0x00, sizeof(*ctrl));
 
 	ctrl->nn = nvmev_vdev->nr_ns;
+#if (SUPPORTED_SSD_TYPE(NVM) || SUPPORTED_SSD_TYPE(CONV))
+	ctrl->oncs = cpu_to_le16(le16_to_cpu(ctrl->oncs) | NVME_CTRL_ONCS_COPY);
+	ctrl->ocfs |= 1 << NVMEV_COPY_FORMAT_0;
+#else
 	ctrl->oncs = 0; //optional command
+#endif
 	ctrl->acl = 3; //minimum 4 required, 0's based value
 	ctrl->vwc = 0;
 	snprintf(ctrl->sn, sizeof(ctrl->sn), "CSL_Virt_SN_%02d", 1);

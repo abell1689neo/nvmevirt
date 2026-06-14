@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/string.h>
 
 #ifdef CONFIG_X86
 #include <asm/e820/types.h>
@@ -350,9 +351,139 @@ static int __proc_file_read(struct seq_file *m, void *data)
 		}
 		seq_printf(m, "total: %u %u %u %llu\n", nr_in_flight, nr_dispatch, nr_dispatched,
 			   total_io);
-	} else if (strcmp(filename, "debug") == 0) {
-		/* Left for later use */
-	}
+	} else if (strcmp(filename, "copy_stat") == 0) {
+		int i;
+		struct nvmev_copy_stat *s = &nvmev_vdev->copy_stat;
+
+		seq_printf(m, "copy_submitted %lld\n", atomic64_read(&s->submitted));
+		seq_printf(m, "copy_succeeded %lld\n", atomic64_read(&s->succeeded));
+		seq_printf(m, "copy_failed %lld\n", atomic64_read(&s->failed));
+		seq_printf(m, "copy_logical_bytes %lld\n", atomic64_read(&s->logical_bytes));
+		seq_printf(m, "copy_descriptor_bytes %lld\n",
+			   atomic64_read(&s->descriptor_bytes));
+		seq_printf(m, "copy_source_read_bytes %lld\n",
+			   atomic64_read(&s->source_read_bytes));
+		seq_printf(m, "copy_destination_write_bytes %lld\n",
+			   atomic64_read(&s->destination_write_bytes));
+		seq_printf(m, "copy_host_payload_avoided_bytes %lld\n",
+			   atomic64_read(&s->host_payload_avoided_bytes));
+		seq_printf(m, "copy_backing_memcpy_bytes %lld\n",
+			   atomic64_read(&s->backing_memcpy_bytes));
+		for (i = 0; i < NVMEV_COPY_STATUS_BUCKETS; i++) {
+			long long count = atomic64_read(&s->status[i]);
+
+			if (!count)
+				continue;
+			seq_printf(m, "copy_status 0x%03x count %lld\n", i,
+				   count);
+		}
+		seq_printf(m, "copy_status_overflow %lld\n",
+			   atomic64_read(&s->status_overflow));
+			for (i = 0; i < 256; i++) {
+				long long cmds = atomic64_read(&nvmev_vdev->opcode_cmds[i]);
+
+				if (!cmds)
+					continue;
+			seq_printf(m, "opcode 0x%02x %s cmds %lld bytes %lld\n",
+					   i, nvme_opcode_string(i), cmds,
+					   atomic64_read(&nvmev_vdev->opcode_bytes[i]));
+			}
+		} else if (strcmp(filename, "worker_stat") == 0) {
+			int i;
+
+			seq_puts(m,
+				 "worker pending copied completed internal copy_ranges free_head free_entries io_head io_tail latest_nsecs\n");
+			for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
+				struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
+				int curr = worker->io_seq;
+				unsigned int pending = 0;
+				unsigned int copied = 0;
+				unsigned int completed = 0;
+				unsigned int internal = 0;
+				unsigned int copy_ranges = 0;
+				unsigned int free_entries = 0;
+				unsigned int guard = 0;
+
+				while (curr != -1 && guard++ < NR_MAX_PARALLEL_IO) {
+					struct nvmev_io_work *w = &worker->work_queue[curr];
+
+					pending++;
+					if (w->is_copied)
+						copied++;
+					if (w->is_completed)
+						completed++;
+					if (w->is_internal)
+						internal++;
+					if (w->copy_ranges)
+						copy_ranges++;
+					curr = w->next;
+				}
+
+				curr = worker->free_seq;
+				guard = 0;
+				while (curr != -1 && guard++ < NR_MAX_PARALLEL_IO) {
+					free_entries++;
+					curr = worker->work_queue[curr].next;
+				}
+
+				seq_printf(m, "%u %u %u %u %u %u %u %u %u %u %llu\n",
+					   worker->id, pending, copied, completed, internal,
+					   copy_ranges, worker->free_seq, free_entries,
+					   worker->io_seq, worker->io_seq_end,
+					   worker->latest_nsecs);
+			}
+		} else if (strcmp(filename, "latency_stat") == 0) {
+			int i;
+
+			seq_puts(m,
+				 "opcode name inflight max_inflight completions wall_completion_ns avg_wall_completion_ns max_wall_completion_ns wall_queue_ns avg_wall_queue_ns max_wall_queue_ns wall_payload_ns avg_wall_payload_ns max_wall_payload_ns model_ns avg_model_ns max_model_ns wall_after_model_ns avg_wall_after_model_ns max_wall_after_model_ns\n");
+			for (i = 0; i < 256; i++) {
+				struct nvmev_opcode_latency_stat *s =
+					&nvmev_vdev->opcode_latency[i];
+				long long inflight = atomic64_read(&s->inflight);
+				long long max_inflight =
+					atomic64_read(&s->max_inflight);
+				long long completions = atomic64_read(&s->completions);
+				long long wall_completion_ns;
+				long long wall_queue_ns;
+				long long wall_payload_ns;
+				long long model_ns;
+				long long wall_after_model_ns;
+				long long divisor;
+
+				if (!completions && !inflight && !max_inflight)
+					continue;
+
+				wall_completion_ns =
+					atomic64_read(&s->wall_completion_ns);
+				wall_queue_ns = atomic64_read(&s->wall_queue_ns);
+				wall_payload_ns =
+					atomic64_read(&s->wall_payload_ns);
+				model_ns = atomic64_read(&s->model_ns);
+				wall_after_model_ns =
+					atomic64_read(&s->wall_after_model_ns);
+				divisor = completions ? completions : 1;
+				seq_printf(m,
+					   "0x%02x %s %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
+					   i, nvme_opcode_string(i), inflight,
+					   max_inflight, completions,
+					   wall_completion_ns,
+					   wall_completion_ns / divisor,
+					   atomic64_read(&s->max_wall_completion_ns),
+					   wall_queue_ns, wall_queue_ns / divisor,
+					   atomic64_read(&s->max_wall_queue_ns),
+					   wall_payload_ns, wall_payload_ns / divisor,
+					   atomic64_read(&s->max_wall_payload_ns),
+					   model_ns, model_ns / divisor,
+					   atomic64_read(&s->max_model_ns),
+					   wall_after_model_ns,
+					   wall_after_model_ns / divisor,
+					   atomic64_read(&s->max_wall_after_model_ns));
+			}
+		} else if (strcmp(filename, "debug") == 0) {
+			seq_printf(m, "copy_prp_fault_once %d\n",
+				   atomic_read(&nvmev_vdev->copy_prp_fault_once));
+		}
 
 	return 0;
 }
@@ -366,9 +497,12 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 	unsigned int ret;
 	unsigned long long *old_stat;
 	struct nvmev_config *cfg = &nvmev_vdev->config;
-	size_t nr_copied;
+	size_t input_len;
 
-	nr_copied = copy_from_user(input, buf, min(len, sizeof(input)));
+	input_len = min(len, sizeof(input) - 1);
+	if (copy_from_user(input, buf, input_len))
+		return -EFAULT;
+	input[input_len] = '\0';
 
 	if (!strcmp(filename, "read_times")) {
 		ret = sscanf(input, "%u %u %u", &cfg->read_delay, &cfg->read_time,
@@ -393,15 +527,33 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 		kfree(old_stat);
 	} else if (!strcmp(filename, "stat")) {
 		int i;
+
 		for (i = 1; i <= nvmev_vdev->nr_sq; i++) {
 			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[i];
+
 			if (!sq)
 				continue;
 
 			memset(&sq->stat, 0x00, sizeof(sq->stat));
 		}
+	} else if (!strcmp(filename, "copy_stat")) {
+		int i;
+
+		memset(&nvmev_vdev->copy_stat, 0x00,
+		       sizeof(nvmev_vdev->copy_stat));
+		for (i = 0; i < 256; i++) {
+			atomic64_set(&nvmev_vdev->opcode_cmds[i], 0);
+			atomic64_set(&nvmev_vdev->opcode_bytes[i], 0);
+		}
+	} else if (!strcmp(filename, "latency_stat")) {
+		memset(nvmev_vdev->opcode_latency, 0x00,
+		       sizeof(nvmev_vdev->opcode_latency));
 	} else if (!strcmp(filename, "debug")) {
-		/* Left for later use */
+		if (sysfs_streq(input, "copy_prp_fault_once")) {
+			atomic_set(&nvmev_vdev->copy_prp_fault_once, 1);
+		} else if (sysfs_streq(input, "copy_prp_fault_clear")) {
+			atomic_set(&nvmev_vdev->copy_prp_fault_once, 0);
+		}
 	}
 
 out:
@@ -457,7 +609,13 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->proc_io_units =
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
-	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_copy_stat =
+		proc_create("copy_stat", 0664, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_worker_stat =
+		proc_create("worker_stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_latency_stat =
+		proc_create("latency_stat", 0664, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_debug = proc_create("debug", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 }
 
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
@@ -466,6 +624,9 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("write_times", nvmev_vdev->proc_root);
 	remove_proc_entry("io_units", nvmev_vdev->proc_root);
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
+	remove_proc_entry("copy_stat", nvmev_vdev->proc_root);
+	remove_proc_entry("worker_stat", nvmev_vdev->proc_root);
+	remove_proc_entry("latency_stat", nvmev_vdev->proc_root);
 	remove_proc_entry("debug", nvmev_vdev->proc_root);
 
 	remove_proc_entry("nvmev", NULL);
@@ -475,6 +636,52 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 
 	if (nvmev_vdev->io_unit_stat)
 		kfree(nvmev_vdev->io_unit_stat);
+}
+
+static void NVMEV_LOG_EXIT_WORKERS(struct nvmev_dev *nvmev_vdev)
+{
+	unsigned int i;
+
+	if (!nvmev_vdev || !nvmev_vdev->io_workers)
+		return;
+
+	for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
+		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
+		int curr = worker->io_seq;
+		int pending = 0;
+		int copied = 0;
+		int completed = 0;
+		int internal = 0;
+		int copy_ranges = 0;
+		int guard = 0;
+
+		if (!worker->work_queue) {
+			NVMEV_INFO("Exit worker %u: work_queue=NULL task=%px\n",
+				   worker->id, worker->task_struct);
+			continue;
+		}
+
+		while (curr != -1 && curr < NR_MAX_PARALLEL_IO &&
+		       guard++ < NR_MAX_PARALLEL_IO) {
+			struct nvmev_io_work *w = &worker->work_queue[curr];
+
+			pending++;
+			if (w->is_copied)
+				copied++;
+			if (w->is_completed)
+				completed++;
+			if (w->is_internal)
+				internal++;
+			if (w->copy_ranges)
+				copy_ranges++;
+			curr = worker->work_queue[curr].next;
+		}
+
+		NVMEV_INFO("Exit worker %u: pending=%d copied=%d completed=%d internal=%d copy_ranges=%d free_head=%u io_head=%u io_tail=%u latest_nsecs=%llu\n",
+			   worker->id, pending, copied, completed, internal,
+			   copy_ranges, worker->free_seq, worker->io_seq,
+			   worker->io_seq_end, worker->latest_nsecs);
+	}
 }
 
 static bool __load_configs(struct nvmev_config *config)
@@ -551,6 +758,7 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 		else
 			BUG_ON(1);
 
+		mutex_init(&ns[i].storage_lock);
 		remaining_capacity -= size;
 		ns_addr += size;
 		NVMEV_INFO("ns %d/%d: size %lld MiB\n", i, nr_ns, BYTE_TO_MB(ns[i].size));
@@ -622,6 +830,8 @@ static int NVMeV_init(void)
 	if (!__load_configs(&nvmev_vdev->config)) {
 		goto ret_err;
 	}
+	atomic_set(&nvmev_vdev->quiescing, 0);
+	atomic_set(&nvmev_vdev->copy_prp_fault_once, 0);
 
 	NVMEV_STORAGE_INIT(nvmev_vdev);
 
@@ -658,14 +868,27 @@ static void NVMeV_exit(void)
 {
 	int i;
 
+	NVMEV_INFO("Exit: quiescing I/O before PCI removal\n");
+	atomic_set(&nvmev_vdev->quiescing, 1);
+	if (!nvmev_io_drain(nvmev_vdev, 5000))
+		NVMEV_ERROR("Exit: I/O worker drain timed out before PCI removal\n");
+
+	NVMEV_INFO("Exit: capturing worker state before PCI removal\n");
+	NVMEV_LOG_EXIT_WORKERS(nvmev_vdev);
+
 	if (nvmev_vdev->virt_bus != NULL) {
+		NVMEV_INFO("Exit: stopping virtual PCI root bus\n");
 		pci_stop_root_bus(nvmev_vdev->virt_bus);
+		NVMEV_INFO("Exit: removing virtual PCI root bus\n");
 		pci_remove_root_bus(nvmev_vdev->virt_bus);
 	}
 
+	NVMEV_INFO("Exit: stopping dispatcher and I/O workers\n");
+	nvmev_io_drain(nvmev_vdev, 1000);
 	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
 	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
 
+	NVMEV_INFO("Exit: finalizing namespaces and storage\n");
 	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
 	NVMEV_STORAGE_FINAL(nvmev_vdev);
 

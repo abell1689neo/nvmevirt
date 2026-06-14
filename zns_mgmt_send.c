@@ -230,7 +230,7 @@ static uint32_t __zmgmt_send_flush_explicit_zrwa(struct zns_ftl *zns_ftl, uint64
 static uint32_t __zmgmt_send(struct zns_ftl *zns_ftl, uint64_t slba, uint32_t action,
 			     uint32_t option)
 {
-	uint32_t status;
+	uint32_t status = NVME_SC_INVALID_FIELD;
 	uint64_t zid = lba_to_zone(zns_ftl, slba);
 
 	switch (action) {
@@ -269,6 +269,11 @@ void zns_zmgmt_send(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev
 	uint64_t slba = cmd->slba;
 	uint64_t zid = lba_to_zone(zns_ftl, slba);
 
+	if (!select_all && zid >= zns_ftl->zp.nr_zones) {
+		status = NVME_SC_LBA_RANGE;
+		goto out;
+	}
+
 	if (select_all) {
 		for (zid = 0; zid < zns_ftl->zp.nr_zones; zid++)
 			__zmgmt_send(zns_ftl, zone_to_slba(zns_ftl, zid), action, option);
@@ -276,6 +281,7 @@ void zns_zmgmt_send(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev
 		status = __zmgmt_send(zns_ftl, slba, action, option);
 	}
 
+out:
 	NVMEV_ZNS_DEBUG("%s slba %llx zid %llu select_all %u action %u status %u option %u\n",
 			__func__, cmd->slba, zid, select_all, cmd->zsa, status, option);
 

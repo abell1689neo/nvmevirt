@@ -4,6 +4,7 @@
 #include <linux/sched/clock.h>
 
 #include "simple_ftl.h"
+#include "copy.h"
 
 static inline unsigned long long __get_wallclock(void)
 {
@@ -13,10 +14,11 @@ static inline unsigned long long __get_wallclock(void)
 static size_t __cmd_io_size(struct nvme_rw_command *cmd)
 {
 	NVMEV_DEBUG_VERBOSE("[%c] %llu + %d, prp %llx %llx\n",
-			cmd->opcode == nvme_cmd_write ? 'W' : 'R', cmd->slba, cmd->length,
-		    cmd->prp1, cmd->prp2);
+			    cmd->opcode == nvme_cmd_write ? 'W' : 'R',
+			    le64_to_cpu(cmd->slba), le16_to_cpu(cmd->length),
+			    le64_to_cpu(cmd->prp1), le64_to_cpu(cmd->prp2));
 
-	return (cmd->length + 1) << LBA_BITS;
+	return (le16_to_cpu(cmd->length) + 1) << LBA_BITS;
 }
 
 /* Return the time to complete */
@@ -73,6 +75,55 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 	return latest;
 }
 
+static bool simple_copy(struct nvmev_ns *ns, struct nvmev_request *req,
+			struct nvmev_result *ret)
+{
+	struct nvmev_copy_ctx ctx;
+	struct nvmev_copy_range *ranges = NULL;
+	unsigned long long latest = req->nsecs_start;
+	u32 i;
+	int err;
+
+	err = nvmev_copy_load_ranges(ns, &req->cmd->copy, &ctx, &ranges);
+	if (err) {
+		ret->status = NVME_SC_INTERNAL;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
+
+	if (ctx.status != NVME_SC_SUCCESS) {
+		ret->status = ctx.status;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
+
+	for (i = 0; i < ctx.nr_ranges; i++) {
+		unsigned long long source_done;
+
+		source_done = __schedule_io_units(nvme_cmd_read, ranges[i].slba,
+						  LBA_TO_BYTE(ranges[i].nlb),
+						  req->nsecs_start);
+		latest = max(latest, source_done);
+	}
+
+	latest = __schedule_io_units(nvme_cmd_write, ctx.sdlba,
+				     LBA_TO_BYTE(ctx.total_lbas), latest);
+
+	ret->status = NVME_SC_SUCCESS;
+	ret->bytes = LBA_TO_BYTE(ctx.total_lbas);
+	ret->nsecs_target = latest;
+	ret->copy_sdlba = ctx.sdlba;
+	ret->copy_nr_ranges = ctx.nr_ranges;
+	ret->copy_desc_bytes = ctx.desc_bytes;
+	ret->copy_source_read_bytes = ret->bytes;
+	ret->copy_destination_write_bytes = ret->bytes;
+	ret->copy_host_payload_avoided_bytes = ret->bytes * 2;
+	ret->copy_ranges = ranges;
+	return true;
+}
+
 bool simple_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			     struct nvmev_result *ret)
 {
@@ -85,15 +136,26 @@ bool simple_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 	case nvme_cmd_write:
 	case nvme_cmd_read:
 		ret->nsecs_target = __schedule_io_units(
-			cmd->common.opcode, cmd->rw.slba,
+			cmd->common.opcode, le64_to_cpu(cmd->rw.slba),
 			__cmd_io_size((struct nvme_rw_command *)cmd), __get_wallclock());
+		ret->bytes = __cmd_io_size((struct nvme_rw_command *)cmd);
+		ret->status = NVME_SC_SUCCESS;
+		break;
+	case nvme_cmd_copy:
+		if (!simple_copy(ns, req, ret))
+			return false;
 		break;
 	case nvme_cmd_flush:
 		ret->nsecs_target = __schedule_flush(req);
+		ret->bytes = 0;
+		ret->status = NVME_SC_SUCCESS;
 		break;
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
 			    nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+		ret->status = NVME_SC_INVALID_OPCODE;
+		ret->bytes = 0;
+		ret->nsecs_target = req->nsecs_start;
 		break;
 	}
 
