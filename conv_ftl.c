@@ -948,6 +948,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t nsecs_xfer_completed;
 	uint32_t allocated_buf_size;
 
+	bool wbuf_full=false;
+
 	struct nand_cmd swr = {
 		.type = USER_IO,
 		.cmd = NAND_WRITE,
@@ -964,14 +966,14 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		ret->nsecs_target = req->nsecs_start;
 		return true;
 	}
-
-	allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
-	if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
-		ret->status = NVME_SC_INTERNAL;
-		ret->bytes = 0;
-		ret->nsecs_target = req->nsecs_start;
-		return true;
-	}
+	wbuf_full=!buffer_reserve(wbuf, LBA_TO_BYTE(nr_lba));
+	// allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
+	// if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
+	// 	ret->status = NVME_SC_INTERNAL;
+	// 	ret->bytes = 0;
+	// 	ret->nsecs_target = req->nsecs_start;
+	// 	return true;
+	// }
 
 	nsecs_latest =
 		ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
@@ -1023,9 +1025,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		check_and_refill_write_credit(conv_ftl);
 	}
 
-	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
+	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)||wbuf_full) {
 		/* Wait all flash operations */
-		ret->nsecs_target = nsecs_latest;
+		ret->nsecs_target = nsecs_latest;//nand 완료 대기 (forward unit access)...?
 	} else {
 		/* Early completion */
 		ret->nsecs_target = nsecs_xfer_completed;
@@ -1122,7 +1124,8 @@ static bool conv_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	struct ppa pending_prog_ppa[SSD_PARTITIONS];
 	bool pending_prog_valid[SSD_PARTITIONS] = { false };
 	bool fua = le32_to_cpu(req->cmd->copy.cdw12) & (1u << 30);
-	uint32_t allocated_buf_size;
+	//uint32_t allocated_buf_size;
+	bool wbuf_full=false;
 	uint32_t part;
 	int err;
 
@@ -1160,15 +1163,15 @@ static bool conv_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		nvmev_copy_free_ranges(ranges);
 		return true;
 	}
-
-	allocated_buf_size = buffer_allocate(wbuf, program_bytes);
-	if (allocated_buf_size < program_bytes) {
-		ret->status = NVME_SC_INTERNAL;
-		ret->bytes = 0;
-		ret->nsecs_target = req->nsecs_start;
-		nvmev_copy_free_ranges(ranges);
-		return true;
-	}
+	wbuf_full=!buffer_reserve(wbuf, program_bytes);
+	// allocated_buf_size = buffer_allocate(wbuf, program_bytes);
+	// if (allocated_buf_size < program_bytes) {
+	// 	ret->status = NVME_SC_INTERNAL;
+	// 	ret->bytes = 0;
+	// 	ret->nsecs_target = req->nsecs_start;
+	// 	nvmev_copy_free_ranges(ranges);
+	// 	return true;
+	// }
 
 	nsecs_source_done = conv_copy_source_reads(ns, req, &ctx, ranges,
 						   &source_read_bytes);
@@ -1221,7 +1224,7 @@ static bool conv_copy(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					   &nsecs_latest);
 	}
 
-	if (fua || (spp->write_early_completion == 0))
+	if (fua || (spp->write_early_completion == 0)||wbuf_full)
 		ret->nsecs_target = nsecs_latest;
 	else
 		ret->nsecs_target = nsecs_buf_done;

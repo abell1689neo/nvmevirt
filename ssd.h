@@ -133,7 +133,7 @@ struct nand_cmd {
 
 struct buffer {
 	size_t size;
-	size_t remaining;
+	int64_t remaining;
 	spinlock_t lock;
 };
 
@@ -266,6 +266,7 @@ uint64_t ssd_next_idle_time(struct ssd *ssd);
 
 void buffer_init(struct buffer *buf, size_t size);
 uint32_t buffer_allocate(struct buffer *buf, size_t size);
+bool buffer_reserve(struct buffer *buf, size_t size); //for DRAM overflow issue
 bool buffer_release(struct buffer *buf, size_t size);
 void buffer_refill(struct buffer *buf);
 

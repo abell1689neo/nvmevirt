@@ -35,6 +35,16 @@ uint32_t buffer_allocate(struct buffer *buf, size_t size)
 	spin_unlock(&buf->lock);
 	return size;
 }
+bool buffer_reserve(struct buffer *buf, size_t size){
+	bool had_room;
+	while(!spin_trylock(&buf->lock)) cpu_relax();
+
+	had_room=(buf->remaining >= (int64_t)size);
+	buf->remaining-=size; //negative value possible
+
+	spin_unlock(&buf->lock);
+	return had_room;
+}
 
 bool buffer_release(struct buffer *buf, size_t size)
 {
@@ -432,7 +442,7 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 		/* write: transfer data through channel first */
 		chnl_stime = max(lun->next_lun_avail_time, cmd_stime);
 
-		chnl_etime = chmodel_request(ch->perf_model, chnl_stime, ncmd->xfer_size);
+		chnl_etime = chmodel_request(ch->perf_model, chnl_stime, ncmd->xfer_size);//bus data latency
 
 		/* write: then do NAND program */
 		nand_stime = chnl_etime;
