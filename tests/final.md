@@ -81,6 +81,14 @@
 - ¹ offload dev_write=420은 dst가 **디바이스 내부 SCC + f2fs 메타**로 써진 것(호스트 발행 아님) → 호스트 read·CPU가 0에 가까운 이유.
 - 현 커널은 토글-off 시 VFS가 generic copy_file_range로 fallback 안 함 → baseline은 naive r/w.
 
+**(d) CPU-foreground** (copy 도는 동안 동시 CPU 앱을 같은 호스트 코어에서 경쟁 → 앱 throughput; GC §1-1(d)와 동형):
+| mode | fg_kops/s | 향상 |
+|---|---|---|
+| **offload** | **235.9** | **+51%** |
+| naive (r/w) | 155.9 | — |
+
+→ **cp 도는 동안 동시 연산 작업이 offload면 +51% 빠름.** 위 cpu_s 4.2×↓(0.069 vs 0.290)가 동시 앱 throughput으로 직결 — **GC (d)의 +14~25%보다 큰 격차**(copy_file_range의 CPU 절감이 더 커서). dm은 비동기 kthread라 이 측정이 구조적으로 불가했지만(§2), copy_file_range는 **프로세스 컨텍스트라 GC처럼 깨끗이** 나옴.
+
 ---
 
 ## 2. dm-kcopyd (블록 계층)
@@ -111,7 +119,7 @@
 
 > NVMe Simple Copy를 NVMeVirt에 구현, **세 응용**(FS·블록 두 계층, 시스템·유저 두 구동)에 적용:
 > - **f2fs GC**(시스템): 명령 128×↓, 트래픽 ~2.4GB/패스 제거, GC CPU 18~26%↓, 동시 앱 14~25%↑. (동기로 wall +10~33%.)
-> - **f2fs copy_file_range**(유저): 200MB 복사에 트래픽 419MB 제거 + 호스트 CPU 4.2×↓. **프로세스 컨텍스트라 CPU 이득 깨끗이 실증**.
+> - **f2fs copy_file_range**(유저): 200MB 복사에 트래픽 419MB 제거 + 호스트 CPU 4.2×↓ + **동시 CPU 앱 +51%**. 프로세스 컨텍스트라 CPU 이득 깨끗이 실증.
 > - **dm-kcopyd**(블록): 클론 805MB·CoW 419MB 트래픽 제거. (CPU는 비동기 kthread라 측정 구조적 불가 → 트래픽이 지표.)
 >
 > 협업자의 정적 census를 **성능 실현 지표(명령·CPU·트래픽·앱 throughput)** 로 확장하고 breadth 확보.
