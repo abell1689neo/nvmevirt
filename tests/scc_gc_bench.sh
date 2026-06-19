@@ -21,7 +21,7 @@ WORKLOADS=(randread randwrite)    # foreground 워크로드
 COPY_MODES=(1 0)                  # 1=copy offload ON, 0=baseline
 #====================================================================
 
-STAMP=$(date +%Y%m%d_%H%M%S); OUT=scc_bench_$STAMP.csv; OUT2=scc_cost_$STAMP.csv
+STAMP=$(date +%Y%m%d_%H%M%S); OUT=scc_bench_$STAMP.csv; OUT2=scc_cost_$STAMP.csv; OUT3=scc_cpufg_$STAMP.csv
 [ "$(id -u)" -eq 0 ] || { echo "root로 실행: sudo bash $0"; exit 1; }
 [ -e "$PARAM" ] || { echo "패치 f2fs 미로드 ($PARAM 없음)"; exit 1; }
 for t in fio f2fs_io python3 fallocate mkfs.f2fs; do
@@ -154,11 +154,51 @@ phase_cost(){
   echo "### 완료 -> $OUT2 ###"
 }
 
+#=================== PHASE 5: CPU-bound foreground vs GC (호스트 CPU 경쟁) ===================
+# GC(copy 작업)와 CPU 연산을 같은 호스트 CPU에 묶음 → offload면 GC가 호스트 CPU를 덜 써서
+# 연산 throughput이 오름 (= "offload가 호스트를 풀어 앱이 빨라진다"의 깨끗한 측정).
+# fio I/O foreground(ab)와 달리 디바이스 워커를 안 거쳐 교란 없음.
+# ※ FGCPU는 nvmev 워커 cpu와 겹치지 않는 호스트 CPU여야 함 (워커가 6,7이면 0 OK).
+phase_cpufg(){
+  echo "### PHASE 5: CPU-bound foreground vs GC -> $OUT3 ###"
+  mountpoint -q "$MNT" || mount -t f2fs "$DEV" "$MNT"
+  command -v taskset >/dev/null || { echo "taskset 필요(util-linux)"; return; }
+  command -v python3 >/dev/null || { echo "python3 필요"; return; }
+  local FGCPU=0
+  echo "valid_pct,copy,fg_kops_per_s,gc_drain_s,gc_reclaimed,copy_submitted" | tee "$OUT3"
+  for vp in "${VALID_PCTS[@]}"; do
+    for cm in "${COPY_MODES[@]}"; do
+      echo $cm > "$PARAM"
+      fragment $vp
+      echo 0 > "$CSTAT"; local r0; r0=$(cat "$GCSYS/gc_reclaimed_segments")
+      rm -f /tmp/gcdone
+      # GC drain을 FGCPU에 핀해 백그라운드로 (소진되면 /tmp/gcdone 생성)
+      local DRAIN='p=-1;n=0;while :;do f2fs_io gc 1 '"$MNT"' >/dev/null 2>&1;c=$(cat '"$GCSYS"'/gc_reclaimed_segments);if [ "$c" = "$p" ];then n=$((n+1)); [ $n -ge 3 ] && break;else n=0;fi;p=$c;done;true'
+      taskset -c $FGCPU bash -c "$DRAIN; touch /tmp/gcdone" &
+      # CPU foreground: 같은 FGCPU에서 GC 끝날 때까지 연산 반복 카운트
+      local t0 t1 cnt
+      t0=$(date +%s.%N)
+      cnt=$(taskset -c $FGCPU python3 -c "import os
+i=0
+while not os.path.exists('/tmp/gcdone'): i+=1
+print(i)")
+      t1=$(date +%s.%N); wait
+      local dur thr recl sub
+      dur=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+      thr=$(awk "BEGIN{printf \"%.1f\", $cnt/1000/($t1-$t0)}")   # k-iterations/sec (GC 중)
+      recl=$(( $(cat "$GCSYS/gc_reclaimed_segments") - r0 )); sub=$(sval copy_submitted)
+      echo "$vp,$cm,$thr,$dur,$recl,${sub:-0}" | tee -a "$OUT3"
+    done
+  done
+  echo "### 완료 -> $OUT3 ###"
+}
+
 case "${1:-all}" in
   model) phase_model;;
   integ) phase_integ;;
   ab)    phase_ab;;
   cost)  phase_cost;;
-  all)   phase_model; phase_integ; phase_ab; phase_cost;;
-  *) echo "사용법: sudo bash $0 [all|model|integ|ab|cost]";;
+  cpufg) phase_cpufg;;
+  all)   phase_model; phase_integ; phase_cost; phase_cpufg;;
+  *) echo "사용법: sudo bash $0 [all|model|integ|ab|cost|cpufg]";;
 esac
